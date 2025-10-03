@@ -19,7 +19,7 @@ import random
 class SlideDataset(ExtendedVisionDataset):
     def __init__(self, root, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)  # type: ignore
-        
+
         folder_path = Path(root)
 
         # Image extensions to look for
@@ -28,13 +28,13 @@ class SlideDataset(ExtendedVisionDataset):
         # Recursively find all image files
         self.image_files = [p for p in folder_path.rglob("*") if p.suffix.lower() in image_extensions]
         print("Found this many files", len(self.image_files))
-        
+
 
     def get_all(self, index):
 
         path = self.image_files[index]
         image = OpenSlide(path)
-        
+
 
         #for level in range(0, image.level_count):
         #    image.read_region((0,0), level = level, size=(224, 244))
@@ -58,7 +58,10 @@ class SlideDataset(ExtendedVisionDataset):
             level = random.randint(0, image_levels - 1)
             if debug:
                 print("picked", level)
-            patch_size = 224
+            #patch_size = 224
+            ## Increase the patch size (multiple of 4) to avoid resize of global and local crops in data/augmentations.py
+            ## to expected patch size in dinov2 i.e 224
+            patch_size = 896
             height = image.level_dimensions[0][1]
             width = image.level_dimensions[0][0]
             if debug:
@@ -79,7 +82,7 @@ class SlideDataset(ExtendedVisionDataset):
                     exit()
                 if debug:
                     print("iteration", i)
-                #4403, 4645) 
+                #4403, 4645)
                 x = random.randint(0, width - patch_size)
                 y = random.randint(0, height - patch_size)
                 if debug:
@@ -92,7 +95,7 @@ class SlideDataset(ExtendedVisionDataset):
 
                 # Convert to RGB (removes alpha channel)
                 patch = patch.convert("RGB")
-                 
+
                 if True:
                     res = patch
                     break
@@ -107,21 +110,21 @@ class SlideDataset(ExtendedVisionDataset):
         #    print(e)
         #    #raise RuntimeError(f"can not read image for sample {index}") from e
         #    exit()
-        
+
         #The transform used is a torchvision StandardTransform.
         #This means that it takes as input two things, and runs two different transforms on both.
         if self.transforms is not None:
             return self.transforms(res, None)
         return res, None
-        
+
     def hsv(self, tile_rgb, patch_size):
-        
+
         #tile_rgb.save("tile.png")
 
         tile = np.array(tile_rgb)
         tile = cv2.cvtColor(tile, cv2.COLOR_RGB2HSV)
         min_ratio = .6
-        
+
         lower_bound = np.array([90, 8, 103])
         upper_bound = np.array([180, 255, 255])
 

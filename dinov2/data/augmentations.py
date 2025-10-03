@@ -24,7 +24,7 @@ import torchvision
 class hed_mod(torch.nn.Module):
 
     def forward(self, img, label = None):
-        
+
         if img !=None:
             #Convert image from RGB to HED.
             #Input shape is (3,size, size)
@@ -38,7 +38,7 @@ class hed_mod(torch.nn.Module):
             mini = -.05
             maxi = .05
             total = maxi - mini
-            
+
             if False:
                 hed_image[..., 0] *= (1 + random.uniform(0, total) - maxi)#H
                 hed_image[..., 1] *= (1 + random.uniform(0, total) - maxi)#E
@@ -47,7 +47,7 @@ class hed_mod(torch.nn.Module):
                 hed_image[..., 0] += random.uniform(0, total) - maxi#H
                 hed_image[..., 1] += random.uniform(0, total) - maxi#E
                 hed_image[..., 2] += random.uniform(0, total) - maxi#D
-           
+
             img = hed2rgb(hed_image)
 
             if False:#debug
@@ -68,12 +68,12 @@ class hed_mod(torch.nn.Module):
                 fig.suptitle("Image Comparison: Before and After HED Channel Modification", y=1.02) # y adjusts title position
 
                 plt.show()
-                
+
                 exit()
             img = rearrange(img, 'h w c -> c h w')
             img = torch.from_numpy(img)
             img = torchvision.transforms.functional.to_pil_image(img)
-        
+
         if label != None:
             label = rearrange(label, 'c h w -> h w c')
             hed_image = rgb2hed(label)
@@ -84,7 +84,7 @@ class hed_mod(torch.nn.Module):
             label = rearrange(label, 'h w c -> c h w')
             label = torch.from_numpy(label)
 
-            return img, label 
+            return img, label
 
         return img
 
@@ -117,8 +117,13 @@ class DataAugmentationDINO(object):
         # random resized crop and flip
         self.geometric_augmentation_global = transforms.Compose(
             [
-                transforms.RandomResizedCrop(
-                    global_crops_size, scale=global_crops_scale, interpolation=transforms.InterpolationMode.BICUBIC
+                # transforms.RandomResizedCrop(
+                #     global_crops_size, scale=global_crops_scale, interpolation=transforms.InterpolationMode.BICUBIC
+                # ),
+                
+                ## Replacing RandomResizedCrop by RandomCrop (inspired by Virchow2 ECT)
+                transforms.RandomCrop(
+                    global_crops_size
                 ),
                 transforms.RandomHorizontalFlip(p=0.5),
             ]
@@ -126,8 +131,13 @@ class DataAugmentationDINO(object):
 
         self.geometric_augmentation_local = transforms.Compose(
             [
+                # transforms.RandomResizedCrop(
+                #     local_crops_size, scale=local_crops_scale, interpolation=transforms.InterpolationMode.BICUBIC
+                # ),
+
+                ## Replacing RandomResizedCrop by RandomCrop (inspired by Virchow2 ECT)
                 transforms.RandomResizedCrop(
-                    local_crops_size, scale=local_crops_scale, interpolation=transforms.InterpolationMode.BICUBIC
+                    local_crops_size
                 ),
                 transforms.RandomHorizontalFlip(p=0.5),
             ]
@@ -180,9 +190,7 @@ class DataAugmentationDINO(object):
         global_crop_2 = self.global_transfo2(im2_base)
 
         output["global_crops"] = [global_crop_1, global_crop_2]
-        
-        #print("gloabl crop shapes", global_crop_1.shape)
-        #print(global_crop_2.shape)
+
         from torchvision.utils import save_image
         if False:#Saving
             save_image(global_crop_1, "global.png")
