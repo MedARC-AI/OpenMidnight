@@ -9,7 +9,7 @@ import logging
 import torch
 from torch import nn
 
-from dinov2.loss import DINOLoss, iBOTPatchLoss, KoLeoLoss, KDELoss
+from dinov2.loss import DINOLoss, iBOTPatchLoss, KoLeoLoss, KDELoss, SimDINOLoss
 from dinov2.models import build_model_from_cfg
 from dinov2.layers import DINOHead
 from dinov2.utils.utils import has_batchnorms
@@ -48,13 +48,30 @@ class SSLMetaArch(nn.Module):
             student_backbone.load_state_dict(chkpt["model"], strict=False)
 
         self.embed_dim = embed_dim
-        self.dino_out_dim = cfg.dino.head_n_prototypes
 
-        self.do_dino = cfg.dino.loss_weight > 0
-        self.do_koleo = cfg.dino.koleo_loss_weight > 0
-        self.do_kde = cfg.dino.kde_loss_weight > 0
-        self.do_ibot = cfg.ibot.loss_weight > 0
-        self.ibot_separate_head = cfg.ibot.separate_head
+        # SimDINO
+        self.do_simdino = cfg.simdino.loss_weight > 0
+        if self.do_simdino:
+            logger.info("OPTIONS -- Using SimDINO")
+            logger.info(f"OPTIONS -- SimDINO -- loss_weight: {cfg.simdino.loss_weight}")
+            logger.info(f"OPTIONS -- SimDINO -- gamma: {cfg.simdino.gamma}")
+            self.simdino_loss_weight = cfg.simdino.loss_weight
+            self.simdino_loss = SimDINOLoss(
+                out_dim=256,
+                gamma=cfg.simdino.gamma,
+            )
+            self.do_dino = False
+            self.do_ibot = False
+            self.do_koleo = False
+            self.do_kde = False
+        else:
+
+            self.dino_out_dim = cfg.dino.head_n_prototypes
+            self.do_dino = cfg.dino.loss_weight > 0
+            self.do_koleo = cfg.dino.koleo_loss_weight > 0
+            self.do_kde = cfg.dino.kde_loss_weight > 0
+            self.do_ibot = cfg.ibot.loss_weight > 0
+            self.ibot_separate_head = cfg.ibot.separate_head
 
         logger.info("OPTIONS -- DINO")
         if self.do_dino:
@@ -80,17 +97,18 @@ class SSLMetaArch(nn.Module):
                 self.kde_loss = KDELoss()
 
         else:
-            logger.info("OPTIONS -- DINO -- not using DINO")
+            if not self.do_simdino:
+                logger.info("OPTIONS -- DINO -- not using DINO")
 
         if self.do_dino or self.do_ibot:
             student_model_dict["dino_head"] = dino_head()
             teacher_model_dict["dino_head"] = dino_head()
 
         logger.info("OPTIONS -- IBOT")
-        logger.info(f"OPTIONS -- IBOT -- loss_weight: {cfg.ibot.loss_weight}")
-        logger.info(f"OPTIONS -- IBOT masking -- ibot_mask_ratio_tuple: {cfg.ibot.mask_ratio_min_max}")
-        logger.info(f"OPTIONS -- IBOT masking -- ibot_mask_sample_probability: {cfg.ibot.mask_sample_probability}")
         if self.do_ibot:
+            logger.info(f"OPTIONS -- IBOT -- loss_weight: {cfg.ibot.loss_weight}")
+            logger.info(f"OPTIONS -- IBOT masking -- ibot_mask_ratio_tuple: {cfg.ibot.mask_ratio_min_max}")
+            logger.info(f"OPTIONS -- IBOT masking -- ibot_mask_sample_probability: {cfg.ibot.mask_sample_probability}")
             self.ibot_loss_weight = cfg.ibot.loss_weight
             assert max(cfg.ibot.mask_ratio_min_max) > 0, "please provide a positive mask ratio tuple for ibot"
             assert cfg.ibot.mask_sample_probability > 0, "please provide a positive mask probability for ibot"
@@ -133,7 +151,56 @@ class SSLMetaArch(nn.Module):
         else:
             loss.backward()
 
+    def _forward_backward_simdino(self, images):
+        n_global_crops = 2
+        n_local_crops = self.cfg.crops.local_crops_number
+
+        global_crops = images["collated_global_crops"].cuda(non_blocking=True)
+        local_crops = images["collated_local_crops"].cuda(non_blocking=True)
+
+        # Teacher forward pass (only on global crops)
+        with torch.no_grad():
+            teacher_output = self.teacher.backbone(global_crops, is_training=True, use_simdino=True)
+            t_g1, t_g2 = teacher_output.chunk(2)
+
+        # Student forward pass on all crops
+        s_g1, s_g2 = self.student.backbone(global_crops, is_training=True, use_simdino=True).chunk(2)
+
+        total_loss = 0.0
+        loss_dict = {}
+
+        # Loss between global views (student_g1 vs teacher_g2, and vice-versa)
+        loss_global = self.simdino_loss(s_g1, t_g2) + self.simdino_loss(s_g2, t_g1)
+        total_loss += loss_global
+        loss_dict["simdino_global_loss"] = loss_global / 2  # Log average
+
+        # Loss between local student views and global teacher views
+        if n_local_crops > 0:
+            student_local_tokens = self.student.backbone(local_crops, is_training=True, use_simdino=True)
+            loss_local = 0.0
+            for s_l_token in student_local_tokens.chunk(n_local_crops):
+                loss_local += self.simdino_loss(s_l_token, t_g1) + self.simdino_loss(s_l_token, t_g2)
+
+            total_loss += loss_local
+            loss_dict["simdino_local_loss"] = loss_local / (n_local_crops * 2) # Log average
+
+        # Total number of loss terms for normalization
+        n_loss_terms = 2 + (n_local_crops * 2) if n_local_crops > 0 else 2
+        total_loss /= n_loss_terms
+
+        loss_accumulator = self.simdino_loss_weight * total_loss
+        self.backprop_loss(loss_accumulator)
+
+        self.fsdp_synchronize_streams()
+
+        loss_dict["simdino_total_loss"] = total_loss
+        return loss_dict
+
     def forward_backward(self, images, teacher_temp):
+
+        if self.do_simdino:
+            return self._forward_backward_simdino(images)
+
         n_global_crops = 2
         assert n_global_crops == 2
         n_local_crops = self.cfg.crops.local_crops_number

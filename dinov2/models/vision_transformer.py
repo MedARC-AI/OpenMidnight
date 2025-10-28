@@ -166,6 +166,18 @@ class DinoVisionTransformer(nn.Module):
         self.norm = norm_layer(embed_dim)
         self.head = nn.Identity()
 
+        # ---- SimDINO projector ----
+        projector_hidden_dim = 2048
+        projector_output_dim = 256
+        self.simdino_projector = Mlp(
+            in_features=embed_dim,
+            hidden_features=projector_hidden_dim,
+            out_features=projector_output_dim,
+            act_layer=nn.GELU,
+            drop=0.0,
+            bias=True,
+        )
+
         self.mask_token = nn.Parameter(torch.zeros(1, embed_dim))
 
         self.init_weights()
@@ -322,11 +334,15 @@ class DinoVisionTransformer(nn.Module):
             return tuple(zip(outputs, class_tokens))
         return tuple(outputs)
 
-    def forward(self, *args, is_training=False, **kwargs):
+    def forward(self, *args, is_training=False, use_simdino=False, **kwargs):
         ret = self.forward_features(*args, **kwargs)
         if is_training:
+            if use_simdino:
+                # For SimDINO, we need the output of the projector
+                return self.simdino_projector(ret["x_norm_clstoken"])
             return ret
         else:
+            # For standard evaluation/inference
             return self.head(ret["x_norm_clstoken"])
 
 

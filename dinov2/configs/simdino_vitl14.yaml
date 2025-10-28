@@ -1,0 +1,38 @@
+
+train:
+  output_dir: ./output/simdino_vitl14
+  centering: "centering"
+
+simdino:
+  loss_weight: 1.0
+  gamma: 0.01
+
+dino:
+  loss_weight: 0.0
+ibot:
+  loss_weight: 0.0
+
+
+student:
+  arch: vit_large
+  patch_size: 14
+  drop_path_rate: 0.4
+  ffn_layer: "swiglufused"
+  block_chunks: 4
+
+teacher:
+  momentum_teacher: 0.994
+
+optim:
+  epochs: 100
+  weight_decay: 0.04
+  weight_decay_end: 0.4
+  base_lr: 2.0e-04
+  warmup_epochs: 10
+
+train:
+  batch_size_per_gpu: 12
+  dataset_path: "ImageNet:split=TRAIN"
+
+crops:
+  local_crops_size: 98
