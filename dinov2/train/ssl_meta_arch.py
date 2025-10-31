@@ -137,7 +137,7 @@ class SSLMetaArch(nn.Module):
         self.student = nn.ModuleDict(student_model_dict)
         self.teacher = nn.ModuleDict(teacher_model_dict)
 
-        # there is no backpropagation through the teacher, so no need for gradients
+        # stop_grad at teacher
         for p in self.teacher.parameters():
             p.requires_grad = False
         logger.info(f"Student and Teacher are built: they are both {cfg.student.arch} network.")
@@ -182,9 +182,9 @@ class SSLMetaArch(nn.Module):
                 loss_local += self.simdino_loss(s_l_token, t_g1) + self.simdino_loss(s_l_token, t_g2)
 
             total_loss += loss_local
-            loss_dict["simdino_local_loss"] = loss_local / (n_local_crops * 2) # Log average
+            loss_dict["simdino_local_loss"] = loss_local / (n_local_crops * 2)
 
-        # Total number of loss terms for normalization
+
         n_loss_terms = 2 + (n_local_crops * 2) if n_local_crops > 0 else 2
         total_loss /= n_loss_terms
 
