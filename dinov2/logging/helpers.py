@@ -10,7 +10,7 @@ import logging
 import time
 
 import torch
-
+import math
 import dinov2.distributed as distributed
 
 
@@ -144,6 +144,8 @@ class SmoothedValue:
         self.fmt = fmt
 
     def update(self, value, num=1):
+        if not math.isfinite(value):
+            value = self.median
         self.deque.append(value)
         self.count += num
         self.total += value * num
