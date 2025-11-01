@@ -180,7 +180,7 @@ class DataAugmentationDINO(object):
         global_crop_2 = self.global_transfo2(im2_base)
 
         output["global_crops"] = [global_crop_1, global_crop_2]
-        
+
         #print("gloabl crop shapes", global_crop_1.shape)
         #print(global_crop_2.shape)
         from torchvision.utils import save_image

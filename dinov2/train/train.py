@@ -2,28 +2,36 @@
 #
 # This source code is licensed under the Apache License, Version 2.0
 # found in the LICENSE file in the root directory of this source tree.
-
+from builtins import dict
 import argparse
 import logging
 import math
 import os
 from functools import partial
-
 from fvcore.common.checkpoint import PeriodicCheckpointer
+
+import timm.optim
 import torch
+import sys
+import timm
+import traceback
 
 from dinov2.data import SamplerType, make_data_loader, make_dataset
 from dinov2.data import collate_data_and_cast, DataAugmentationDINO, MaskingGenerator
 import dinov2.distributed as distributed
-from dinov2.fsdp import FSDPCheckpointer
 from dinov2.logging import MetricLogger
 from dinov2.utils.config import setup
 from dinov2.utils.utils import CosineScheduler
 
-from dinov2.train.ssl_meta_arch import SSLMetaArch
+from dinov2.train.ssl_meta_arch import SimSSLMetaArch
 
 
+from dinov2.utils.checkpoint import PeriodicCheckpointer
+from dinov2.fsdp import DCPCheckpointer as FSDPCheckpointer
+from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
+import pickle
 torch.backends.cuda.matmul.allow_tf32 = True  # PyTorch 1.12 sets this to False by default
+
 logger = logging.getLogger("dinov2")
 import wandb
 
@@ -322,7 +330,7 @@ def do_train(cfg, model, resume=False):
 def main(args):
     cfg = setup(args)
 
-    model = SSLMetaArch(cfg).to(torch.device("cuda"))
+    model = SimSSLMetaArch(cfg).to(torch.device("cuda"))
     #Load model here from pretrained.
     if True:#cfg.train.use_pretrained and "\'arch\': \'vit_small\'" in str(cfg):#Temporary check
         print("load small")
