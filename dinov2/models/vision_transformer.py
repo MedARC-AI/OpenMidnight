@@ -195,7 +195,7 @@ class DinoVisionTransformer(nn.Module):
         nn.init.normal_(self.cls_token, std=1e-6)
         if self.register_tokens is not None:
             nn.init.normal_(self.register_tokens, std=1e-6)
-            
+
         def init_weights_vit_timm(module: nn.Module, name: str = ""):
             """ViT weight initialization, original timm impl (for reproducibility)"""
             if isinstance(module, nn.Linear):
@@ -203,49 +203,7 @@ class DinoVisionTransformer(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
         named_apply(init_weights_vit_timm, self)
-    def update_img_size(self, img_size, keep_raw=False):
-        if img_size == self.patch_embed.img_size:
-            return
-        if keep_raw and "raw_pos_embed" in self.__dict__:
-            self.pos_embed = self.raw_pos_embed
-        N = self.pos_embed.shape[1] - 1
-        M = int(math.sqrt(N))  # Recover the number of patches in each dimension
-        assert N == M * M
-        dim = self.pos_embed.shape[-1]
-        pos_embed = self.pos_embed.float()
-        class_pos_embed = pos_embed[:, :1]
-        patch_pos_embed = pos_embed[:, 1:]
-        w0 = img_size // self.patch_size
-        h0 = img_size // self.patch_size
-        kwargs = {}
-        if self.interpolate_offset:
-            # Historical kludge: add a small number to avoid floating point error in the interpolation, see https://github.com/facebookresearch/dino/issues/8
-            # Note: still needed for backward-compatibility, the underlying operators are using both output size and scale factors
-            sx = float(w0 + self.interpolate_offset) / M
-            sy = float(h0 + self.interpolate_offset) / M
-            kwargs["scale_factor"] = (sx, sy)
-        else:
-            # Simply specify an output size instead of a scale factor
-            kwargs["size"] = (w0, h0)
-        patch_pos_embed = nn.functional.interpolate(
-            patch_pos_embed.reshape(1, M, M, dim).permute(0, 3, 1, 2),
-            mode="bicubic",
-            antialias=self.interpolate_antialias,
-            **kwargs,
-        )
-        assert (w0, h0) == patch_pos_embed.shape[-2:]
-        patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
-        pos_embed = torch.cat((class_pos_embed, patch_pos_embed), dim=1).to(self.pos_embed.dtype)
-        if keep_raw: self.raw_pos_embed =self.pos_embed
-        self.pos_embed =nn.Parameter(pos_embed)
-        self.patch_embed.update_img_size(img_size)
-    
-    def update_patch_size(self, patch_size, keep_raw=False):
-        if  patch_size == self.patch_size:
-            return
-        self.patch_embed.update_patch_size(patch_size, keep_raw)
-        self.patch_size = patch_size
-        
+
     def interpolate_pos_encoding(self, x, w, h):
         previous_dtype = x.dtype
         npatch = x.shape[1] - 1
@@ -507,50 +465,6 @@ def vit_large(patch_size=16, num_register_tokens=0, block="nested", **kwargs):
         depth=24,
         num_heads=16,
         mlp_ratio=4,
-        block_fn=get_block_fn(block),
-        num_register_tokens=num_register_tokens,
-        **kwargs,
-    )
-    return model
-
-
-def vit_so150m(patch_size=16, num_register_tokens=0, block="nested", **kwargs):
-    """ SO150M (shape optimized) """
-    model = DinoVisionTransformer(
-        patch_size=patch_size,
-        embed_dim=896, depth=18, num_heads=14, mlp_ratio=2.572,
-        block_fn=get_block_fn(block),
-        num_register_tokens=num_register_tokens,
-        **kwargs,
-    )
-    return model
-
-
-def vit_so150m2(patch_size=16, num_register_tokens=0, block="nested", **kwargs):
-    """ SO150M v2 (shape optimized, but diff than paper def, optimized for GPU) """
-    model = DinoVisionTransformer(
-        patch_size=patch_size,
-        embed_dim=832, depth=21, num_heads=13, mlp_ratio=34/13,
-        block_fn=get_block_fn(block),
-        num_register_tokens=num_register_tokens,
-        **kwargs,
-    )
-    return model
-
-def vit_so300m(patch_size=16, num_register_tokens=0, block="nested", **kwargs):
-    model = DinoVisionTransformer(
-        patch_size=patch_size,
-        embed_dim=1024, depth=24, num_heads=16, mlp_ratio=3.375,
-        block_fn=get_block_fn(block),
-        num_register_tokens=num_register_tokens,
-        **kwargs,
-    )
-    return model
-
-def vit_so400m(patch_size=16, num_register_tokens=0, block="nested", **kwargs):
-    model = DinoVisionTransformer(
-        patch_size=patch_size,
-        embed_dim=1152, depth=27, num_heads=16, mlp_ratio=3.7362,
         block_fn=get_block_fn(block),
         num_register_tokens=num_register_tokens,
         **kwargs,
