@@ -3,42 +3,49 @@
 # This source code is licensed under the Apache License, Version 2.0
 # found in the LICENSE file in the root directory of this source tree.
 
-# References:
-#   https://github.com/facebookresearch/dino/blob/master/vision_transformer.py
-#   https://github.com/rwightman/pytorch-image-models/tree/master/timm/layers/patch_embed.py
-
 import logging
 import os
-from typing import Callable, List, Any, Tuple, Dict, Optional
+from typing import Callable, List, Any, Tuple, Dict
 import warnings
 
 import torch
 from torch import nn, Tensor
 
-from .attention import Attention, MemEffAttention
+from .attention import Attention
 from .drop_path import DropPath
 from .layer_scale import LayerScale
 from .mlp import Mlp
 
-
 logger = logging.getLogger("dinov2")
 
-
+XFORMERS_AVAILABLE = False
 XFORMERS_ENABLED = os.environ.get("XFORMERS_DISABLED") is None
 try:
     if XFORMERS_ENABLED:
         from xformers.ops import fmha, scaled_index_add, index_select_cat
-
         XFORMERS_AVAILABLE = True
         warnings.warn("xFormers is available (Block)")
     else:
         warnings.warn("xFormers is disabled (Block)")
-        raise ImportError
 except ImportError:
-    XFORMERS_AVAILABLE = False
-
     warnings.warn("xFormers is not available (Block)")
 
+if not XFORMERS_AVAILABLE:
+    def scaled_index_add(input, index, source, scaling, alpha):
+        return torch.index_add(input, dim=0, source=scaling * source, index=index, alpha=alpha)
+    def index_select_cat(sources, indices):
+        return torch.cat([s[i.long()].flatten() for s, i in zip(sources, indices)], dim=0)
+
+def setup_layer_scales(dim, init_value):
+    if init_value:
+        if isinstance(init_value, float):
+            init_value = (init_value, init_value)
+        ls1 = LayerScale(dim, init_values=init_value[0])
+        ls2 = LayerScale(dim, init_values=init_value[1])
+    else:
+        ls1 = nn.Identity()
+        ls2 = nn.Identity()
+    return ls1, ls2
 
 class Block(nn.Module):
     def __init__(
@@ -49,17 +56,29 @@ class Block(nn.Module):
         qkv_bias: bool = False,
         proj_bias: bool = True,
         ffn_bias: bool = True,
-        drop: float = 0.0,
+        ffn_drop: float = 0.0,
         attn_drop: float = 0.0,
-        init_values=None,
+        layerscale=None,     # SimDINO parameter name
+        init_values=None,    # Standard DINO parameter name (Added for compatibility)
         drop_path: float = 0.0,
+        qknorm=False,
+        inline_linear=False,
+        max_resolution=14,
+        ext_token_num=5,
+        base=20,
         act_layer: Callable[..., nn.Module] = nn.GELU,
         norm_layer: Callable[..., nn.Module] = nn.LayerNorm,
         attn_class: Callable[..., nn.Module] = Attention,
         ffn_layer: Callable[..., nn.Module] = Mlp,
+        **kwargs,
     ) -> None:
         super().__init__()
-        # print(f"biases: qkv: {qkv_bias}, proj: {proj_bias}, ffn: {ffn_bias}")
+        
+        # Compatibility Fix:
+        # If layerscale is None but init_values is provided (by standard DINO code), use init_values.
+        if layerscale is None and init_values is not None:
+            layerscale = init_values
+
         self.norm1 = norm_layer(dim)
         self.attn = attn_class(
             dim,
@@ -67,10 +86,14 @@ class Block(nn.Module):
             qkv_bias=qkv_bias,
             proj_bias=proj_bias,
             attn_drop=attn_drop,
-            proj_drop=drop,
+            proj_drop=ffn_drop,
+            qknorm=qknorm,
+            inline_linear=inline_linear,
+            max_resolution=max_resolution,
+            ext_token_num=ext_token_num,
+            base=base
         )
-        self.ls1 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
-        self.drop_path1 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        self.ls1, self.ls2 = setup_layer_scales(dim, layerscale)
 
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
@@ -78,13 +101,13 @@ class Block(nn.Module):
             in_features=dim,
             hidden_features=mlp_hidden_dim,
             act_layer=act_layer,
-            drop=drop,
+            drop=ffn_drop,
             bias=ffn_bias,
         )
-        self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
-        self.drop_path2 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
         self.sample_drop_ratio = drop_path
+        self.ext_token_num = ext_token_num
 
     def forward(self, x: Tensor) -> Tensor:
         def attn_residual_func(x: Tensor) -> Tensor:
@@ -94,7 +117,6 @@ class Block(nn.Module):
             return self.ls2(self.mlp(self.norm2(x)))
 
         if self.training and self.sample_drop_ratio > 0.1:
-            # the overhead is compensated only for a drop path rate larger than 0.1
             x = drop_add_residual_stochastic_depth(
                 x,
                 residual_func=attn_residual_func,
@@ -106,140 +128,86 @@ class Block(nn.Module):
                 sample_drop_ratio=self.sample_drop_ratio,
             )
         elif self.training and self.sample_drop_ratio > 0.0:
-            x = x + self.drop_path1(attn_residual_func(x))
-            x = x + self.drop_path1(ffn_residual_func(x))  # FIXME: drop_path2
+            x = x + self.drop_path(attn_residual_func(x))
+            x = x + self.drop_path(ffn_residual_func(x))
         else:
             x = x + attn_residual_func(x)
             x = x + ffn_residual_func(x)
         return x
-
-
-class CausalAttentionBlock(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        ffn_ratio: float = 4.0,
-        ls_init_value: Optional[float] = None,
-        is_causal: bool = True,
-        act_layer: Callable = nn.GELU,
-        norm_layer: Callable = nn.LayerNorm,
-        dropout_prob: float = 0.0,
-    ):
-        super().__init__()
-
-        self.dim = dim
-        self.is_causal = is_causal
-        self.ls1 = LayerScale(dim, init_values=ls_init_value) if ls_init_value else nn.Identity()
-        self.attention_norm = norm_layer(dim)
-        self.attention = Attention(dim, num_heads, attn_drop=dropout_prob, proj_drop=dropout_prob)
-
-        self.ffn_norm = norm_layer(dim)
-        ffn_hidden_dim = int(dim * ffn_ratio)
-        self.feed_forward = Mlp(
-            in_features=dim,
-            hidden_features=ffn_hidden_dim,
-            drop=dropout_prob,
-            act_layer=act_layer,
-        )
-
-        self.ls2 = LayerScale(dim, init_values=ls_init_value) if ls_init_value else nn.Identity()
-
-    def init_weights(
-        self,
-        init_attn_std: float | None = None,
-        init_proj_std: float | None = None,
-        init_fc_std: float | None = None,
-        factor: float = 1.0,
-    ) -> None:
-        init_attn_std = init_attn_std or (self.dim**-0.5)
-        init_proj_std = init_proj_std or init_attn_std * factor
-        init_fc_std = init_fc_std or (2 * self.dim) ** -0.5
-        self.attention.init_weights(init_attn_std, init_proj_std)
-        self.attention_norm.reset_parameters()
-        nn.init.normal_(self.feed_forward.fc1.weight, std=init_fc_std)
-        nn.init.normal_(self.feed_forward.fc2.weight, std=init_proj_std)
-        self.ffn_norm.reset_parameters()
-
-    def forward(
-        self,
-        x: torch.Tensor,
-    ):
-        x_attn = x + self.ls1(self.attention(self.attention_norm(x), self.is_causal))
-        x_ffn = x_attn + self.ls2(self.feed_forward(self.ffn_norm(x_attn)))
-        return x_ffn
-
 
 def drop_add_residual_stochastic_depth(
     x: Tensor,
     residual_func: Callable[[Tensor], Tensor],
     sample_drop_ratio: float = 0.0,
 ) -> Tensor:
-    # 1) extract subset using permutation
     b, n, d = x.shape
     sample_subset_size = max(int(b * (1 - sample_drop_ratio)), 1)
-    brange = (torch.randperm(b, device=x.device))[:sample_subset_size]
-    x_subset = x[brange]
-
-    # 2) apply residual_func to get residual
+    keep_index = (torch.randperm(b, device=x.device))[:sample_subset_size]
+    x_subset = x[keep_index]
     residual = residual_func(x_subset)
-
     x_flat = x.flatten(1)
     residual = residual.flatten(1)
-
     residual_scale_factor = b / sample_subset_size
-
-    # 3) add the residual
-    x_plus_residual = torch.index_add(x_flat, 0, brange, residual.to(dtype=x.dtype), alpha=residual_scale_factor)
+    x_plus_residual = torch.index_add(
+        x_flat, 0, keep_index, residual.to(dtype=x.dtype), alpha=residual_scale_factor
+    )
     return x_plus_residual.view_as(x)
 
-
-def get_branges_scales(x, sample_drop_ratio=0.0):
+def get_indexs_scales(x, sample_drop_ratio=0.0):
     b, n, d = x.shape
     sample_subset_size = max(int(b * (1 - sample_drop_ratio)), 1)
-    brange = (torch.randperm(b, device=x.device))[:sample_subset_size]
+    keep_index = (torch.randperm(b, device=x.device))[:sample_subset_size]
     residual_scale_factor = b / sample_subset_size
-    return brange, residual_scale_factor
+    return keep_index, residual_scale_factor
 
-
-def add_residual(x, brange, residual, residual_scale_factor, scaling_vector=None):
+def add_residual(x, keep_index, residual, residual_scale_factor, scaling_vector=None):
     if scaling_vector is None:
         x_flat = x.flatten(1)
         residual = residual.flatten(1)
-        x_plus_residual = torch.index_add(x_flat, 0, brange, residual.to(dtype=x.dtype), alpha=residual_scale_factor)
+        x_plus_residual = torch.index_add(
+            x_flat,
+            0,
+            keep_index,
+            residual.to(dtype=x.dtype),
+            alpha=residual_scale_factor,
+        )
     else:
         x_plus_residual = scaled_index_add(
-            x, brange, residual.to(dtype=x.dtype), scaling=scaling_vector, alpha=residual_scale_factor
+            x,
+            keep_index,
+            residual.to(dtype=x.dtype),
+            scaling=scaling_vector,
+            alpha=residual_scale_factor,
         )
     return x_plus_residual
 
-
 attn_bias_cache: Dict[Tuple, Any] = {}
 
-
-def get_attn_bias_and_cat(x_list, branges=None):
-    """
-    this will perform the index select, cat the tensors, and provide the attn_bias from cache
-    """
-    batch_sizes = [b.shape[0] for b in branges] if branges is not None else [x.shape[0] for x in x_list]
+def get_attn_bias_and_cat(x_list, keep_indexs=None):
+    batch_sizes = (
+        [b.shape[0] for b in keep_indexs]
+        if keep_indexs is not None
+        else [x.shape[0] for x in x_list]
+    )
     all_shapes = tuple((b, x.shape[1]) for b, x in zip(batch_sizes, x_list))
     if all_shapes not in attn_bias_cache.keys():
         seqlens = []
         for b, x in zip(batch_sizes, x_list):
             for _ in range(b):
                 seqlens.append(x.shape[1])
-        attn_bias = fmha.BlockDiagonalMask.from_seqlens(seqlens)
+        attn_bias = fmha.attn_bias.BlockDiagonalMask.from_seqlens(seqlens)
         attn_bias._batch_sizes = batch_sizes
         attn_bias_cache[all_shapes] = attn_bias
 
-    if branges is not None:
-        cat_tensors = index_select_cat([x.flatten(1) for x in x_list], branges).view(1, -1, x_list[0].shape[-1])
+    if keep_indexs is not None:
+        cat_tensors = index_select_cat(
+            [x.flatten(1) for x in x_list], keep_indexs
+        ).view(1, -1, x_list[0].shape[-1])
     else:
         tensors_bs1 = tuple(x.reshape([1, -1, *x.shape[2:]]) for x in x_list)
         cat_tensors = torch.cat(tensors_bs1, dim=1)
 
     return attn_bias_cache[all_shapes], cat_tensors
-
 
 def drop_add_residual_stochastic_depth_list(
     x_list: List[Tensor],
@@ -247,53 +215,57 @@ def drop_add_residual_stochastic_depth_list(
     sample_drop_ratio: float = 0.0,
     scaling_vector=None,
 ) -> Tensor:
-    # 1) generate random set of indices for dropping samples in the batch
-    branges_scales = [get_branges_scales(x, sample_drop_ratio=sample_drop_ratio) for x in x_list]
-    branges = [s[0] for s in branges_scales]
-    residual_scale_factors = [s[1] for s in branges_scales]
+    keep_indexs_scales = [
+        get_indexs_scales(x, sample_drop_ratio=sample_drop_ratio) for x in x_list
+    ]
+    keep_indexs = [s[0] for s in keep_indexs_scales]
+    residual_scale_factors = [s[1] for s in keep_indexs_scales]
 
-    # 2) get attention bias and index+concat the tensors
-    attn_bias, x_cat = get_attn_bias_and_cat(x_list, branges)
-
-    # 3) apply residual_func to get residual, and split the result
-    residual_list = attn_bias.split(residual_func(x_cat, attn_bias=attn_bias))  # type: ignore
+    attn_bias, x_cat = get_attn_bias_and_cat(x_list, keep_indexs)
+    residual_list = attn_bias.split(residual_func(x_cat, attn_bias=attn_bias))
 
     outputs = []
-    for x, brange, residual, residual_scale_factor in zip(x_list, branges, residual_list, residual_scale_factors):
-        outputs.append(add_residual(x, brange, residual, residual_scale_factor, scaling_vector).view_as(x))
+    for x, keep_index, residual, residual_scale_factor in zip(
+        x_list, keep_indexs, residual_list, residual_scale_factors
+    ):
+        outputs.append(
+            add_residual(
+                x, keep_index, residual, residual_scale_factor, scaling_vector
+            ).view_as(x)
+        )
     return outputs
-
 
 class NestedTensorBlock(Block):
     def forward_nested(self, x_list: List[Tensor]) -> List[Tensor]:
-        """
-        x_list contains a list of tensors to nest together and run
-        """
-        assert isinstance(self.attn, MemEffAttention)
-
         if self.training and self.sample_drop_ratio > 0.0:
-
             def attn_residual_func(x: Tensor, attn_bias=None) -> Tensor:
                 return self.attn(self.norm1(x), attn_bias=attn_bias)
 
             def ffn_residual_func(x: Tensor, attn_bias=None) -> Tensor:
                 return self.mlp(self.norm2(x))
 
+            ls1 = ls2 = None
+            if isinstance(self.ls1, LayerScale):
+                ls1 = self.ls1.gamma
+                
             x_list = drop_add_residual_stochastic_depth_list(
                 x_list,
                 residual_func=attn_residual_func,
                 sample_drop_ratio=self.sample_drop_ratio,
-                scaling_vector=self.ls1.gamma if isinstance(self.ls1, LayerScale) else None,
+                scaling_vector=ls1,
             )
+            
+            if isinstance(self.ls2, LayerScale):
+                ls2 = self.ls2.gamma
+                
             x_list = drop_add_residual_stochastic_depth_list(
                 x_list,
                 residual_func=ffn_residual_func,
                 sample_drop_ratio=self.sample_drop_ratio,
-                scaling_vector=self.ls2.gamma if isinstance(self.ls1, LayerScale) else None,
+                scaling_vector=ls2,
             )
             return x_list
         else:
-
             def attn_residual_func(x: Tensor, attn_bias=None) -> Tensor:
                 return self.ls1(self.attn(self.norm1(x), attn_bias=attn_bias))
 
@@ -309,8 +281,6 @@ class NestedTensorBlock(Block):
         if isinstance(x_or_x_list, Tensor):
             return super().forward(x_or_x_list)
         elif isinstance(x_or_x_list, list):
-            if not XFORMERS_AVAILABLE:
-                raise AssertionError("xFormers is required for using nested tensors")
             return self.forward_nested(x_or_x_list)
         else:
             raise AssertionError
