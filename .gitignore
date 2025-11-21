@@ -1,11 +1,46 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+
+# Distribution / packaging
 build/
 dist/
 *.egg-info/
-**/__pycache__/
+_version.py
 
-**/.ipynb_checkpoints
-**/.ipynb_checkpoints/**
-
-*.swp
-
+# IDE
 .vscode/
+
+# Virtual environment
+.venv/
+.python-version
+
+# Environment variables
+.env
+.env.*
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Local data
+datasets
+checkpoints
+wandb
+jobs
+
+# Local scratch/tmp
+.scratch
+tmp
+.tmp*
+
+# specific files
+output*
+sample_dataset_30.txt
+uv.lock 
+watch_run.sh
+wandb/
+HEST/
+eva-probe/
+eval/
+CLAUDE.md
+AGENTS.md

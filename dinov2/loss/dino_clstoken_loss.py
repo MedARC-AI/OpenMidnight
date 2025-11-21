@@ -164,8 +164,9 @@ class DINOLoss(DINOCenter):
         self,
         out_dim,
         student_temp=0.1,
+        center_momentum=0.9, # Added for backward compat
     ):
-        super().__init__(out_dim)
+        super().__init__(out_dim, center_momentum=center_momentum)
         self.student_temp = student_temp
         self.reduce_handle = None
         self.len_teacher_output = None
@@ -175,7 +176,6 @@ class DINOLoss(DINOCenter):
         """
         Cross-entropy between softmax outputs of the teacher and student networks.
         """
-        # TODO: Use cross_entropy_distribution here
         total_loss = 0
         global_loss = 0
         for i, s in enumerate(student_output_list):

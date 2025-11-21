@@ -9,6 +9,18 @@ import random
 
 def collate_data_and_cast(samples_list, mask_ratio_tuple, mask_probability, dtype, n_tokens=None, mask_generator=None):
     # dtype = torch.half  # TODO: Remove
+    
+    #So this is our batch basically, just in a list.
+
+    #print(samples_list[-1][-1])
+
+    images = []
+    indexes = []
+    for sample in samples_list:
+        images.append(sample[0])
+        indexes.append(sample[1])
+    
+    samples_list = images
 
     n_global_crops = len(samples_list[0][0]["global_crops"])
     n_local_crops = len(samples_list[0][0]["local_crops"])
@@ -46,4 +58,5 @@ def collate_data_and_cast(samples_list, mask_ratio_tuple, mask_probability, dtyp
         "masks_weight": masks_weight,
         "upperbound": upperbound,
         "n_masked_patches": torch.full((1,), fill_value=mask_indices_list.shape[0], dtype=torch.long),
+        "indexes": indexes
     }

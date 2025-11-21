@@ -53,38 +53,54 @@ dino:
     coeff: 1
     coeff_end: -1
   loss_weight: 1.0
-  head_n_prototypes: 256
+  head_n_prototypes: 65536
   head_bottleneck_dim: 256
   head_nlayers: 3
   head_hidden_dim: 2048
-  koleo_loss_weight: 0
   remove_last_layer: true
   head_normalize: true
+  kde_loss_weight: 0.0 
+  koleo_loss_weight: 0.1
 ibot:
   use_mcr: true
-  loss_weight: 1
+  loss_weight: 1.0
+  mask_sample_probability: 0.5
+  mask_ratio_min_max:
+  - 0.1
+  - 0.5
   separate_head: false
-  head_n_prototypes: 256
+  head_n_prototypes: 65536
+  head_bottleneck_dim: 256
+  head_nlayers: 3
+  head_hidden_dim: 2048
   remove_last_layer: true
 train:
-  output_dir: /dinov2/outputs/vitl16_reg4_simdinov2
-  centering: none
+  streaming_from_hf: True
+  batch_size_per_gpu: 44
+  centering: sinkhorn_knopp
+  use_pretrained: False
+  OFFICIAL_EPOCH_LENGTH: 1250
+  num_workers: 4 # should be 4 or less if streaming from HF to avoid too many open files error
 student:
-  arch: vit_large
-  drop_path_rate: 0.2
-  layerscale: 0.1
+  arch: vit_giant2
+  patch_size: 16
+  drop_path_rate: 0.4
+  ffn_layer: swiglufused
+  block_chunks: 4
+  num_register_tokens: 4
 teacher:
-  momentum_teacher: 0.9
+  momentum_teacher: 0.994
   final_momentum_teacher: 1
   warmup_teacher_temp: 0.04
   teacher_temp: 0.07
   warmup_teacher_temp_epochs: 30
 optim:
   opt: adamw
-  epochs: 100
+  epochs: 8000
+  early_stop: 200
   weight_decay: 0.04
   weight_decay_end: 0.4
-  base_lr: 0.004
+  base_lr: 2.0e-04
   lr: 0.  # will be set after applying scaling rule
   warmup_epochs: 10
   min_lr: 1.0e-06
@@ -93,7 +109,7 @@ optim:
   freeze_last_layer_epochs: 1
   scaling_rule: sqrt_wrt_1024
   patch_embed_lr_mult: 0.2
-  layerwise_decay: 0.9
+  layerwise_decay: 1.0
   kwargs:
     foreach: true
     betas: [0.9, 0.999]

@@ -10,11 +10,15 @@ from .decoders import TargetDecoder, ImageDataDecoder
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple, Union
 from PIL import Image
-from openslide import OpenSlide#other options?
+from openslide import OpenSlide
 import random
 import numpy as np
 import cv2
 import random
+
+
+import torch
+import torchvision.transforms as transforms
 
 class SlideDataset(ExtendedVisionDataset):
     def __init__(self, root, *args, **kwargs) -> None:
@@ -26,97 +30,127 @@ class SlideDataset(ExtendedVisionDataset):
         image_extensions = {'.svs'}
 
         # Recursively find all image files
-        self.image_files = [p for p in folder_path.rglob("*") if p.suffix.lower() in image_extensions]
-        print("Found this many files", len(self.image_files))
+        self.image_files_svs = [p for p in folder_path.rglob("*") if p.suffix.lower() in image_extensions]
+        print("Found this many files", len(self.image_files_svs))
         
+        #Load dataset_listed, which contains our acceptable patch indexes
+        #/data/TCGA/575011dc-d267-4cb7-9ba2-e4d4c3c60f75/TCGA-CV-6959-01Z-00-DX1.AEC54909-0A3A-43E2-966C-7410CD7488EF.svs 13568 48128 0
+        #Format is path, index, index, level
+        #
+        """
+        self.levels = [[],[],[],[]]
+        self.used_levels = [[],[],[],[]]
+        with open("patches_listed", "r") as f:
+            for line in f.readlines():
+                parts = line.split(" ")
+                path = parts[0]
+                x = path[1]
+                y = path[2]
+                level = path[3]
+                
+                #We don't count this
+                if level >=4:
+                    pass
+                self.levels[level].append((path, x, y))
+        """
+        self.image_files = []
+
+        #Finishg copying from the .py
+        with open("sample_dataset_30.txt", "r") as f:
+            for line in f.readlines():
+                self.image_files.append(line)
+
+        print("This many resolved paths", len(self.image_files))
+
+
+
+    #Takes a pil version of the highest level.
+    def pseudo_unet(self, img, comp_w, comp_h):
+       
+        crop_height = comp_h
+        crop_width = comp_w
+
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        _, thresh = cv2.threshold(gray, 160, 255, cv2.THRESH_BINARY_INV)
+        #210 is the invere for how strong a pixel is - 255 is pure white.
+        #In our case, we have a lot of light data, which we *do* want to work with anyway
+        if False:
+            cv2.imwrite("binary.png", thresh)
+            cv2.imwrite("gray.png", gray)
+            #exit()
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(thresh, 8, cv2.CV_32S)
+        valid_components = []
+        for i in range(1, num_labels):
+            # The bounding box is at stats[i, cv2.CC_STAT_LEFT], stats[i, cv2.CC_STAT_TOP],
+            # stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT]
+            x = stats[i, cv2.CC_STAT_LEFT]
+            y = stats[i, cv2.CC_STAT_TOP]
+            w = stats[i, cv2.CC_STAT_WIDTH]
+            h = stats[i, cv2.CC_STAT_HEIGHT]
+
+            # Filter out components that are too small
+            #Since we could be grabbing a piece at 224x224, ??
+            if w >= crop_width and h >= crop_height:
+                if False:
+                    thresh_color = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
+                    cv2.rectangle(thresh_color, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                    cv2.imwrite(str(i) + "bounding.png", thresh_color)
+                valid_components.append({'x': x, 'y': y, 'w': w, 'h': h})
+
+        if not valid_components:
+            #print("No valid components found to crop from.")
+            return None
+
+        return valid_components
 
     def get_all(self, index):
 
-        path = self.image_files[index]
+        path = self.image_files_svs[index]
         image = OpenSlide(path)
-        
-
-        #for level in range(0, image.level_count):
-        #    image.read_region((0,0), level = level, size=(224, 244))
         return image, path
 
     def __getitem__(self, index: int) -> Tuple[Any, Any]:
         debug = False
+
+        if False:#Speed test
+            
+            test_data = torch.randn((3, 224, 224))
+            return self.transforms(transforms.ToPILImage()(test_data), None), index
+
         if True:
             path = self.image_files[index]
-            if debug:
-                print(path)
+            
+            #/data/TCGA/575011dc-d267-4cb7-9ba2-e4d4c3c60f75/TCGA-CV-6959-01Z-00-DX1.AEC54909-0A3A-43E2-966C-7410CD7488EF.svs 13645 48161 0
+            path, x, y, level = path.split(" ")
+            x = int(x)
+            y = int(y)
+            level = int(level)
+
             image = OpenSlide(path)
-            image_levels = image.level_count
-            if debug:
-                print("This many image levels", image_levels)
-                print("This dim", image.level_dimensions)#((49933, 41465), (12483, 10366), (3120, 2591))
 
-            #for key, value in image.properties.items():
-            #    print(f"{key}: {value}")
-
-            level = random.randint(0, image_levels - 1)
-            if debug:
-                print("picked", level)
             patch_size = 224
             height = image.level_dimensions[0][1]
             width = image.level_dimensions[0][0]
-            if debug:
-                print("these dims", image.level_dimensions[level])
-            if False:#debug saving all.
-                full = image.read_region((0,0), level = level, size=(int(width), int(height)))
-                full.save("full.png")
-                print("saved full")
+    
+            #read_region is based on the top left pixel in the level 0, not our current level
+            patch = image.read_region((x, y), level=level, size=(patch_size, patch_size))
 
-            #read_region is based on the top left pixel in the level 0, not our current
-            i = 0
-            while True:
-                if debug:
-                    print("start loop", flush = True)
-                i = i + 1
-                if i == 100:
-                    print("Couldn't find matching item in slide", path, flush = True)
-                    exit()
-                if debug:
-                    print("iteration", i)
-                #4403, 4645) 
-                x = random.randint(0, width - patch_size)
-                y = random.randint(0, height - patch_size)
-                if debug:
-                    print("Reading this", path, x, y, level)
-                try:
-                    patch = image.read_region((x, y), level=level, size=(patch_size, patch_size))
-                except:
-                    print("failed on path", path, x, y, level)
-                    exit()
+            
 
-                # Convert to RGB (removes alpha channel)
-                patch = patch.convert("RGB")
-                 
-                if True:
-                    res = patch
-                    break
-                res = self.hsv(patch, patch_size)
-                print("have result", path, x, y, level)
-                if res == None:
-                    pass
-                else:
-                    break
-        #except Exception as e:
-        #    print("Crash", path)
-        #    print(e)
-        #    #raise RuntimeError(f"can not read image for sample {index}") from e
-        #    exit()
-        
         #The transform used is a torchvision StandardTransform.
         #This means that it takes as input two things, and runs two different transforms on both.
+        #Patch is a pillow image.
+
+        res = patch.convert("RGB")#Removes alpha - not sure this is the best way to do this thuogh
         if self.transforms is not None:
-            return self.transforms(res, None)
-        return res, None
+            return self.transforms(res, None), index
+
+        return res, None, index
         
     def hsv(self, tile_rgb, patch_size):
         
         #tile_rgb.save("tile.png")
+
 
         tile = np.array(tile_rgb)
         tile = cv2.cvtColor(tile, cv2.COLOR_RGB2HSV)
@@ -134,7 +168,9 @@ class SlideDataset(ExtendedVisionDataset):
             return tile_rgb
         else:
             #tile_rgb.show()
+            #print("Ratio fail", ratio)
             return None
 
     def __len__(self) -> int:
         return len(self.image_files)
+

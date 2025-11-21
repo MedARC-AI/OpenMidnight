@@ -18,13 +18,18 @@ from einops import rearrange, reduce, repeat
 import random
 import matplotlib.pyplot as plt
 logger = logging.getLogger("dinov2")
-
+import numpy as np
 import torchvision
 
 class hed_mod(torch.nn.Module):
 
     def forward(self, img, label = None):
         
+
+        chance = random.uniform(0,1) > .5
+        if chance:
+            return img
+
         if img !=None:
             #Convert image from RGB to HED.
             #Input shape is (3,size, size)
@@ -35,19 +40,19 @@ class hed_mod(torch.nn.Module):
             img_orig = img
             hed_image = rgb2hed(img)
             #Modify channels, each with random amount, between -.05 and .05
-            mini = -.05
+            mini =  -.05
             maxi = .05
-            total = maxi - mini
-            
             if False:
-                hed_image[..., 0] *= (1 + random.uniform(0, total) - maxi)#H
-                hed_image[..., 1] *= (1 + random.uniform(0, total) - maxi)#E
-                hed_image[..., 2] *= (1 + random.uniform(0, total) - maxi)#D
+                hed_image[..., 0] *= (1 + random.uniform(mini, maxi))#H
+                hed_image[..., 1] *= (1 + random.uniform(mini, maxi))#E
+                hed_image[..., 2] *= (1 + random.uniform(mini, maxi))#D
             else:
-                hed_image[..., 0] += random.uniform(0, total) - maxi#H
-                hed_image[..., 1] += random.uniform(0, total) - maxi#E
-                hed_image[..., 2] += random.uniform(0, total) - maxi#D
-           
+                hed_image[..., 0] += random.uniform(mini, maxi)#H
+                hed_image[..., 1] += random.uniform(mini, maxi)#E
+                hed_image[..., 2] += random.uniform(mini, maxi)#D
+
+            #Make sure legit image
+            hed_image = np.clip(hed_image, 0, 1)   
             img = hed2rgb(hed_image)
 
             if False:#debug
@@ -137,7 +142,8 @@ class DataAugmentationDINO(object):
         color_jittering = transforms.Compose(
             [
                 transforms.RandomApply(
-                    [transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1)],
+                    #[transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1)],
+                    [transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1, hue=0.05)],
                     p=0.8,
                 ),
                 transforms.RandomGrayscale(p=0.2),
@@ -163,28 +169,45 @@ class DataAugmentationDINO(object):
             ]
         )
 
-        hed = hed_mod()
+    
+        self.global_transfo1 = transforms.Compose([hed_mod(), color_jittering, global_transfo1_extra, self.normalize])#Do we apply to everything?
+        self.global_transfo2 = transforms.Compose([hed_mod(), color_jittering, global_transfo2_extra, self.normalize])
+        self.local_transfo = transforms.Compose([hed_mod(), color_jittering, local_transfo_extra, self.normalize])
 
-        self.global_transfo1 = transforms.Compose([color_jittering, global_transfo1_extra, self.normalize])#Do we apply to everything?
-        self.global_transfo2 = transforms.Compose([color_jittering, global_transfo2_extra, self.normalize])
-        self.local_transfo = transforms.Compose([hed, color_jittering, local_transfo_extra, self.normalize])
+        
+        #self.global_nohed = transforms.Compose([color_jittering, global_transfo1_extra, self.normalize])
+        #self.global_nohed2 = transforms.Compose([color_jittering, global_transfo2_extra, self.normalize])
+        #self.local_nohed = transforms.Compose([color_jittering, local_transfo_extra, self.normalize])
+
+        self.hedonly = transforms.Compose([hed_mod(), self.normalize])
+
+
 
     def __call__(self, image):
-        output = {}
 
+        output = {}
         # global crops:
         im1_base = self.geometric_augmentation_global(image)
         global_crop_1 = self.global_transfo1(im1_base)
+
 
         im2_base = self.geometric_augmentation_global(image)
         global_crop_2 = self.global_transfo2(im2_base)
 
         output["global_crops"] = [global_crop_1, global_crop_2]
-
+        
         #print("gloabl crop shapes", global_crop_1.shape)
         #print(global_crop_2.shape)
         from torchvision.utils import save_image
         if False:#Saving
+            image.save("original.png")
+            save_image(self.hedonly(im1_base), "global_hed.png")
+            save_image(self.hedonly(im2_base), "global2_hed.png")
+
+            save_image(global_crop_1, "global.png")
+            save_image(global_crop_2, "global2.png")
+            save_image(self.global_nohed(im1_base), "global1_nohed.png")
+            save_image(self.global_nohed2(im2_base), "global2_nohed.png")
             save_image(global_crop_1, "global.png")
             save_image(global_crop_2, "global2.png")
             exit()
@@ -198,6 +221,22 @@ class DataAugmentationDINO(object):
         if False:
             for i, local in enumerate(local_crops):
                 save_image(local, str(i) + "local" + ".png")
+            local_crops_new = [
+                    self.local_nohed(self.geometric_augmentation_local(image)) for _ in range(self.local_crops_number)
+                ]
+
+            local_crops_new2 = [
+                    self.hedonly(self.geometric_augmentation_local(image)) for _ in range(self.local_crops_number)
+                ]
+
+
+            for i, local in enumerate(local_crops_new):
+                save_image(local, str(i) + "localnohed.png")
+            
+            for i, local in enumerate(local_crops_new2):
+                save_image(local, str(i) + "localhed2.png")
+
+                
             exit()
         output["local_crops"] = local_crops
         output["offsets"] = ()

@@ -1,0 +1,37 @@
+dino:
+  head_n_prototypes: 131072
+  head_bottleneck_dim: 384
+  do_kde: True
+  kde_loss_weight: .05
+  koleo_loss_weight: 0
+  do_koleo: False
+ibot:
+  separate_head: true
+  head_n_prototypes: 131072
+train:
+  streaming_from_hf: True
+  batch_size_per_gpu: 44 # lowered from 48 to avoid CUDA OOM on 1 GPU
+  centering: sinkhorn_knopp
+  use_pretrained: True
+  OFFICIAL_EPOCH_LENGTH: 1250
+  num_workers: 4
+student:
+  arch: vit_giant2
+  patch_size: 14
+  drop_path_rate: 0.4
+  ffn_layer: swiglufused
+  block_chunks: 4
+  num_register_tokens: 4
+teacher:
+  momentum_teacher: 0.994
+optim:
+  epochs: 55 
+  early_stop: 55 
+  weight_decay_end: 0.2
+  base_lr: 2.0e-04  # learning rate for a batch size of 1024 (swapped from 3.5e-4 to 2.0e-4)
+  warmup_epochs: 7
+  layerwise_decay: 1.0
+crops:
+  local_crops_size: 98
+evaluation:
+  eval_period_iterations: 3750 # save checkpoint every 3 epochs

@@ -1,118 +1,229 @@
-# Pathology DinoV2
+<h1> OpenMidnight </h1>
 
-**[SophontAI](https://sophontai.com/)**
+<p align="center"><img width="735" height="400" alt="2PJpVl2k51pfjFg2Vs-oS" src="https://github.com/user-attachments/assets/fd00a9f5-3248-46ed-883a-f423e54ac2b6" /></p>
+<p align="center">Fully open-source and improved replication of Kaiko.AI's pathology foundation model <a href="https://arxiv.org/abs/2504.05186v1">Midnight</a>.</p>
+<div id="badges" align="center">
+  <a href="https://sophont.med/blog/openmidnight"><img src="https://img.shields.io/badge/Blog-Training%20SOTA%20Pathology%20Foundation%20Model%20with%20%241.6k-111827?style=for-the-badge&logo=read.cv&logoColor=white" /> </a>
+  <a href="https://discord.gg/tVR4TWnRM9"><img src="https://img.shields.io/badge/Discord-Collaborate%20with%20us-5865F2?style=for-the-badge&logo=discord&logoColor=white" /></a>     
+</div>
+<p align="center"> <a href="https://sophont.med">Sophont</a> · <a href="https://medarc.ai">MedARC</a> </p>
 
-In this repository, following a plethora of works before us, we apply DINO(V2) to the pathology space.
-If you are interested in helping out, check the open Issues.
-## Installation
+This is a publicly developed, open-source project by [MedARC](https://www.medarc.ai/). If you are interested in helping out, [join our Discord server](https://discord.gg/tVR4TWnRM9) and introduce yourself in our `#path-fm` channel.
 
-Clone the repository, cd into it, then run the provided installation script. 
-```shell
-pip install uv
-uv sync
+
+## Features
+- Trains faster with improved average benchmarking performance compared to the original Midnight-12K model (~3 days to train using 1×8×H100)
+- Supports single‑GPU up to multi‑node training with FSDP
+- Robust resuming from last checkpoint functionality if training gets interrupted
+- Weights & Biases (wandb) logging for monitoring/tracking model training
+- Optionally stream data from Hugging Face so no need to download any data in advance (TCGA-12K is approximately 12 TB)
+
+# Installation
+
+Clone the repository:
+
+```bash
+git clone https://github.com/MedARC-AI/openmidnight.git
+```
+
+Change into the directory, then run the installation script:
+
+```bash
+./install.sh
+```
+
+This will create a virtual environment, "pathologydino", with all necessary packages pre-installed, located as a .venv folder in the same directory as openmidnight. It will automatically detect your machine's CUDA version and install packages appropriately.
+
+Note: We have only personally verified training works as intended with this repository using H100 GPUs.
+
+```bash
 source .venv/bin/activate
-cp _utils.py .venv/lib/python3.10/site-packages/eva/core/models/wrappers/
-```
-This will create a virtual environment with all necessary packages pre-installed called "pathologydino", located as a .venv folder in the same directory as path-fm.
-
-## Training
-
-We provide a script, run.sh.
-This will activate the venv created above, and run training on a single node. 
-If you modified the venv directory, you will need to make that change in run.sh also.
-
-```shell
-bash run.sh
+wandb init
 ```
 
-By default, we make only 4 GPUs visible, and run on those 4. If you want to change the indexes, modify the numbers after "CUDA_VISIBLE_DEVICES=0,1,2,3".
+By default, we log model training to wandb. Run `wandb init` inside of `openmidnight/` before starting your training run so that wandb is properly configured.
 
-If you change the number of GPUs, you will need to change the value of "--nproc_per_node=4" to properly reflect this.
+You can now run one of our `run*.sh` scripts to train your model (see Training section below), using the YAML config specified in that script.
 
-By default, we use a vits, with 4 registers. This is reflected in the config. 
+Once you have successfully completed model training (or have downloaded [our pretrained checkpoint](https://huggingface.co/SophontAI/OpenMidnight/blob/main/teacher_checkpoint.pth)), you can evaluate using [Kaiko.AI's eva framework](https://github.com/kaiko-ai/eva) and the [Mahmood Lab's HEST benchmark](https://github.com/mahmoodlab/HEST) (skip to the Evaluation section below).
 
-Output will be saved into the directory specificed by "--output_dir". Ensure that this directory does not contain any old files from training runs, or the code will attempt to resume instead.
+# Training
 
+We use `run*.sh` to initiate training runs via torchrun. Depending on your compute setting, modify and run the corresponding shell script described in the relevant subsection below.
 
-## Evaluation
+We use YAML configs for specifying important hyperparameters during training. These files are located in `dinov2/configs/train/` (not in `eval_configs/`, which stores YAML configs for eva evaluation benchmarking). Our replication checkpoint specifically used `dinov2/configs/train/vitg14_reg4.yaml`.
 
-At this time, we use [Kaiko-Eva](https://github.com/kaiko-ai/eva) for evaluation.
-In order to test the [Bach](https://arxiv.org/abs/1808.04277) dataset, you will run:
+There are some variables that are specified in `run*.sh` directly (as opposed to the YAML config), such as the output directory for saving checkpoints, whether to enable resume functionality, and the specific CUDA devices you want to train with.
+
+If you are getting rate limited by huggingface, one easy method to increase your rate is to first `export HF_TOKEN=<your HF token here>` before running your code (https://huggingface.co/settings/tokens).
+
+## Dataset prep
+
+If you are wanting to exactly replicate our checkpoint, note that we did not train via streaming from huggingface. This feature was subsequently added and needs to be enabled in your YAML config (`train.streaming_from_hf=[True,False]`). Unless you enable this, you will need to first locally download the TCGA-12K dataset (~12TB) and then use the scripts provided in `prepatching_scripts/` to create a txt file containing the svs filepaths and locations/magnitude from which to create patches on-the-fly during model training. You can alternatively use [our original sample_dataset_30.txt file](https://huggingface.co/SophontAI/OpenMidnight/blob/main/sample_dataset_30.txt), but note you would need to modify that txt to correct its use of absolute filepaths.
+
+## Training Single GPU (Short Config)
+
+```bash
+./run_short_1gpu.sh
 ```
-eva predict fit --config dinov2/eval_config.yaml
+
+We are still working on a YAML config tweaked to support an informative, short training run on a single GPU that can be completed in under 24 hours. We hope this can be particularly useful for debugging and ablation experiments.
+
+The current `run_short_1gpu.sh` uses `dinov2/configs/train/vitg14_reg4_short1.yaml`, which is the same as the full reproduction's YAML config but with batch size lowered from 48 to 44, epochs lowered from 200 to 15, warmup_epochs lowered from 10 to 7, no early stopping, and FSDPCheckpointing disabled (so resuming an interrupted run will not work). On a single H100 GPU, this run completes in ~5 hours (will likely run out of memory on older GPUs).
+
+We also provide another YAML config, `dinov2/configs/train/vitg14_reg4_short2.yaml` which is identical but increases the epochs to 55, taking around 20 hours on 1 H100 to train.
+
+## Training Single Node, Multi‑GPU (Full Reproduction)
+
+```bash
+./run_1node.sh
 ```
-Please modify the checkpoint_path to match the checkpoint you wish to test.
-Trained checkpoints will be found in output_dir/eval/training_X.
 
+Train across multiple GPUs on a single node. Our released checkpoint used this script for training.
 
-# Prior Work
+## Training Multi‑Node (Full Reproduction)
 
+Same as training single‑node multi‑GPU, except increase `NNODES` in both `run_master_node.sh` and `run_other_nodes.sh` to the number of total nodes you are training across. Then run the corresponding scripts.
 
-## Patch-level models
+```bash
+./run_master_node.sh # on master node
+```
+```bash
+./run_other_nodes.sh # on non-master nodes
+```
 
-| Name                                                                                                                                              | Group                                                                                                           | Weights            | Released                                                                                              | SSL                                                                             | WSIs                            | Tiles    | Patients   | Batch size | Iterations | Architecture           | Parameters | Embed dim | Input size | Dataset                                          | Links                                                                                                                                                                                                                                                                                                                                        |
-| ------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- | ------------------ | ----------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- | ------------------------------- | -------- | ---------- | ---------- | ---------- | ---------------------- | ---------- | --------- | ---------- | ------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [CTransPath](https://www.sciencedirect.com/science/article/abs/pii/S1361841522002043)                                                             | Sichuan University / Tencent AI Lab                                                                             | :white_check_mark: | Dec 2021[\*](https://github.com/Xiyue-Wang/TransPath/commit/4b1c67655dd38cb192567b0981b6c1e9ade59ecf) | [SRCL](https://www.sciencedirect.com/science/article/abs/pii/S1361841522002043) | 32K                             | 16M      |            |            |            | Swin-Transformer       |            | 768       | 224        | TCGA, PAIP                                       | [<img src="https://raw.githubusercontent.com/FortAwesome/Font-Awesome/6.x/svgs/brands/github.svg" width="20">](https://github.com/Xiyue-Wang/TransPath)                                                                                                                                                                                      |
-| [RetCCL](https://www.sciencedirect.com/science/article/abs/pii/S1361841522002043)                                                                 | Sichuan University / Tencent AI Lab                                                                             | :white_check_mark: | Dec 2021[\*](https://github.com/Xiyue-Wang/RetCCL/commit/e6faf0bd85c8e7e617882dd5d74e644d28eac771)    | [CCL](https://www.sciencedirect.com/science/article/abs/pii/S1361841522002043)  | 32K                             | 16M      |            |            |            | ResNet-50              |            | 2048      | 224        | TCGA, PAIP                                       | [<img src="https://raw.githubusercontent.com/FortAwesome/Font-Awesome/6.x/svgs/brands/github.svg" width="20">](https://github.com/Xiyue-Wang/RetCCL)                                                                                                                                                                                         |
-| [REMEDIS](https://www.nature.com/articles/s41551-023-01049-7)                                                                                     | [Google Research](https://research.google)                                                                      | :white_check_mark: | May 2022[\*](https://arxiv.org/abs/2205.09723v1)                                                      | SimCLR/BiT                                                                      | 29K                             | 50M      | 11K cases  | 4096       | 1.2M       | ResNet-50              |            | 2048      | 224        | TCGA                                             | [<img src="https://raw.githubusercontent.com/FortAwesome/Font-Awesome/6.x/svgs/brands/github.svg" width="20">](https://github.com/google-research/medical-ai-research-foundations)                                                                                                                                                           |
-| [HIPT](https://ieeexplore.ieee.org/document/9880275)                                                                                              | [Mahmood Lab](https://faisal.ai)                                                                                | :white_check_mark: | Jun 2022[\*](https://arxiv.org/abs/2206.02647v1)                                                      | DINOv1                                                                          | 11K                             | 100M     |            | 256        | 400K       | ViT-S                  |            | 384       | 256        | TCGA                                             | [<img src="https://raw.githubusercontent.com/FortAwesome/Font-Awesome/6.x/svgs/brands/github.svg" width="20">](https://github.com/mahmoodlab/HIPT)                                                                                                                                                                                           |
-| [Lunit-DINO](https://arxiv.org/abs/2212.04690)                                                                                                    | [Lunit](https://www.lunit.io)                                                                                   | :white_check_mark: | Dec 2022[\*](https://arxiv.org/abs/2212.04690v1)                                                      | DINOv1                                                                          | 21K                             |          |            |            |            | ViT-S                  |            | 384       | 224        | TCGA                                             | [<img src="https://raw.githubusercontent.com/FortAwesome/Font-Awesome/6.x/svgs/brands/github.svg" width="20">](https://github.com/lunit-io/benchmark-ssl-pathology)                                                                                                                                                                          |
-| [Lunit-{BT,MoCoV2,SwAV}](https://arxiv.org/abs/2212.04690)                                                                                        | [Lunit](https://www.lunit.io)                                                                                   | :white_check_mark: | Dec 2022[\*](https://arxiv.org/abs/2212.04690v1)                                                      | {BT,MoCoV2,SwAV}                                                                | 21K                             |          |            |            |            | ResNet-50              |            | 2048      | 224        | TCGA                                             | [<img src="https://raw.githubusercontent.com/FortAwesome/Font-Awesome/6.x/svgs/brands/github.svg" width="20">](https://github.com/lunit-io/benchmark-ssl-pathology)                                                                                                                                                                          |
-| [Phikon](https://www.medrxiv.org/content/10.1101/2023.07.21.23292757v2)                                                                           | [Owkin](https://www.owkin.com)                                                                                  | :white_check_mark: | Jul 2023[\*](https://www.medrxiv.org/content/10.1101/2023.07.21.23292757v1)                           | iBOT                                                                            | 6.1K                            | 43M      | 5.6K       | 1440       | 155K       | ViT-B                  | 86M        | 768       | 224        | TCGA                                             | [<img src="https://raw.githubusercontent.com/FortAwesome/Font-Awesome/6.x/svgs/brands/github.svg" width="20">](https://github.com/owkin/HistoSSLscaling) [<img src="https://huggingface.co/datasets/huggingface/brand-assets/resolve/main/hf-logo.svg" width="25">](https://huggingface.co/owkin/phikon)                                     |
-| [CONCH](https://www.nature.com/articles/s41591-024-02856-4) (VL)                                                                                  | [Mahmood Lab](https://faisal.ai)                                                                                | :white_check_mark: | Jul 2023[\*](https://arxiv.org/abs/2307.12914v1)                                                      | iBOT & vision-language pretraining                                              | 21K                             | 16M      |            | 1024       | 80 epochs  | ViT-B                  | 86M        | 768       | 224        | proprietary                                      | [<img src="https://raw.githubusercontent.com/FortAwesome/Font-Awesome/6.x/svgs/brands/github.svg" width="20">](https://github.com/mahmoodlab/CONCH) [<img src="https://huggingface.co/datasets/huggingface/brand-assets/resolve/main/hf-logo.svg" width="25">](https://huggingface.co/MahmoodLab/CONCH)                                      |
-| **[UNI](https://www.nature.com/articles/s41591-024-02857-3)**                                                                                     | [Mahmood Lab](https://faisal.ai)                                                                                | :white_check_mark: | Aug 2023[\*](https://arxiv.org/abs/2308.15474v1)                                                      | DINOv2                                                                          | **100K**                        | 100M     |            |            |            | ViT-L                  |            | 1024      | 224        | proprietary (Mass-100K)                          | [<img src="https://raw.githubusercontent.com/FortAwesome/Font-Awesome/6.x/svgs/brands/github.svg" width="20">](https://github.com/mahmoodlab/UNI) [<img src="https://huggingface.co/datasets/huggingface/brand-assets/resolve/main/hf-logo.svg" width="25">](https://huggingface.co/MahmoodLab/UNI)                                          |
-| **[Virchow](https://www.nature.com/articles/s41591-024-03141-0)**                                                                                 | [Paige](https://paige.ai) / [Microsoft](https://www.microsoft.com/en-us/research/lab/microsoft-health-futures)  | :white_check_mark: | Sep 2023[\*](https://arxiv.org/abs/2309.07778v1)                                                      | DINOv2                                                                          | **1.5M**                        |          | 120K       |            |            | ViT-H                  | 632M       | 2560      | 224        | proprietary (from MSKCC)                         | [<img src="https://huggingface.co/datasets/huggingface/brand-assets/resolve/main/hf-logo.svg" width="25">](https://huggingface.co/paige-ai/Virchow)                                                                                                                                                                                          |
-| **[Campanella _et al._](https://arxiv.org/abs/2310.07033)** (DINO)                                                                                | [Thomas Fuchs Lab](https://www.hpims.org/labs/thomas-fuchs-lab/)                                                | :white_check_mark: | Oct 2023[\*](https://arxiv.org/abs/2310.07033v1)                                                      | DINOv1                                                                          | **420K**                        | 3.3B     | 77K        | 1080       | 1.3K INE   | ViT-S                  | 22M        | 384       | 224        | proprietary (MSHS)                               | [<img src="https://huggingface.co/datasets/huggingface/brand-assets/resolve/main/hf-logo.svg" width="25">](https://huggingface.co/MountSinaiCompPath/SP22M) ([<img src="https://huggingface.co/datasets/huggingface/brand-assets/resolve/main/hf-logo.svg" width="25">](https://huggingface.co/MountSinaiCompPath/SP85M))                    |
-| **[Campanella _et al._](https://arxiv.org/abs/2310.07033)** (MAE)                                                                                 | [Thomas Fuchs Lab](https://www.hpims.org/labs/thomas-fuchs-lab/)                                                | :x:                | Oct 2023[\*](https://arxiv.org/abs/2310.07033v1)                                                      | MAE                                                                             | **420K**                        | 3.3B     | 77K        | 1440       | 2.5K INE   | ViT-L                  | 303M       | 1024      | 224        | proprietary (MSHS)                               |
-| [Path Foundation](https://arxiv.org/abs/2310.13259)                                                                                               | [Google](https://research.google)                                                                               | :white_check_mark: | Oct 2023[\*](https://arxiv.org/abs/2310.13259v1)                                                      | SimCLR, MSN                                                                     | 6K                              | 60M      |            | 1024       |            | ViT-S                  |            | 384       | 224        | TCGA                                             | [<img src="https://raw.githubusercontent.com/FortAwesome/Font-Awesome/6.x/svgs/brands/github.svg" width="20">](https://github.com/Google-Health/imaging-research/tree/master/path-foundation)                                                                                                                                                |
-| [PathoDuet](https://arxiv.org/abs/2312.09894)                                                                                                     | [Shanghai Jiao Tong University](https://life.sjtu.edu.cn/)                                                      | :white_check_mark: | Dec 2023[\*](https://arxiv.org/abs/2312.09894v1)                                                      | inspired by MoCoV3                                                              | 11K                             | 13M      |            | 2048       | 100 epochs | ViT-B                  |            | 4096      | 224        | TCGA                                             | [<img src="https://raw.githubusercontent.com/FortAwesome/Font-Awesome/6.x/svgs/brands/github.svg" width="20">](https://github.com/openmedlab/PathoDuet)                                                                                                                                                                                      |
-| **[RudolfV](https://arxiv.org/abs/2401.04079)**                                                                                                   | [Aignostics](https://www.aignostics.com)                                                                        | :x:                | Jan 2024[\*](https://arxiv.org/abs/2401.04079v1)                                                      | DINOv2                                                                          | **130K**                        | 750M     | 36K        |            |            | ViT-L                  | 300M       |           | 224        | proprietary (from EU & US), TCGA                 |
-| [kaiko](https://arxiv.org/abs/2404.15217)                                                                                                         | [kaiko.ai](https://www.kaiko.ai)                                                                                | :white_check_mark: | Mar 2024[\*](https://arxiv.org/abs/2404.15217v1)                                                      | DINOv2                                                                          | 29K                             | 260M\*\* |            | 512        | 200 INE    | ViT-L                  |            | 1024      | 224        | TCGA                                             | [<img src="https://raw.githubusercontent.com/FortAwesome/Font-Awesome/6.x/svgs/brands/github.svg" width="20">](https://github.com/kaiko-ai/towards_large_pathology_fms)                                                                                                                                                                      |
-| **[PLUTO](https://arxiv.org/abs/2405.07905)**                                                                                                     | [PathAI](https://www.pathai.com)                                                                                | :x:                | May 2024[\*](https://arxiv.org/abs/2405.07905v1)                                                      | DINOv2 (+ MAE and Fourier loss)                                                 | **160K**                        | 200M     |            |            |            | FlexiViT-S             | 22M        |           | 224        | proprietary (PathAI)                             |                                                                                                                                                                                                                                                                                                                                              |
-| [BEPH](https://www.biorxiv.org/content/10.1101/2024.05.16.594499)                                                                                 | [Shanghai Jiao Tong University](https://life.sjtu.edu.cn/)                                                      | :white_check_mark: | May 2024[\*](https://www.biorxiv.org/content/10.1101/2024.05.16.594499v1)                             | BEiTv2                                                                          | 12K                             | 12M      |            | 1024       |            | ViT-B                  | 193M       | 1024      | 224        | TCGA                                             | [<img src="https://raw.githubusercontent.com/FortAwesome/Font-Awesome/6.x/svgs/brands/github.svg" width="20">](https://github.com/Zhcyoung/BEPH)                                                                                                                                                                                             |
-| **[Prov-GigaPath](https://www.nature.com/articles/s41586-024-07441-w)**                                                                           | [Microsoft](https://www.microsoft.com/en-us/research/) / [Providence](https://www.providence.org)               | :white_check_mark: | May 2024[\*](https://www.nature.com/articles/s41586-024-07441-w)                                      | DINOv2                                                                          | **170K**                        | 1.4B     | 30K        | 384        |            | ViT                    |            | 1536      | 224        | proprietary (Providence)                         | [<img src="https://raw.githubusercontent.com/FortAwesome/Font-Awesome/6.x/svgs/brands/github.svg" width="20">](https://github.com/prov-gigapath/prov-gigapath) [<img src="https://huggingface.co/datasets/huggingface/brand-assets/resolve/main/hf-logo.svg" width="25">](https://huggingface.co/prov-gigapath/prov-gigapath)                |
-| **[Hibou-B](https://arxiv.org/abs/2406.05074)**                                                                                                   | [HistAI](https://www.hist.ai)                                                                                   | :white_check_mark: | Jun 2024[\*](https://arxiv.org/abs/2406.05074v1)                                                      | DINOv2                                                                          | **1.1M**                        | 510M     | 310K cases | 1024       | 500K       | ViT-B                  | 86M        | 768       | 224        | proprietary                                      | [<img src="https://raw.githubusercontent.com/FortAwesome/Font-Awesome/6.x/svgs/brands/github.svg" width="20">](https://github.com/HistAI/hibou) [<img src="https://huggingface.co/datasets/huggingface/brand-assets/resolve/main/hf-logo.svg" width="25">](https://huggingface.co/histai/hibou-b)                                            |
-| **[Hibou-L](https://arxiv.org/abs/2406.05074)**                                                                                                   | [HistAI](https://www.hist.ai)                                                                                   | :white_check_mark: | Jun 2024[\*](https://arxiv.org/abs/2406.05074v1)                                                      | DINOv2                                                                          | **1.1M**                        | 1.2B     | 310K cases | 1024       | 1.2M       | ViT-L                  | 304M       | 1024      | 224        | proprietary                                      | [<img src="https://raw.githubusercontent.com/FortAwesome/Font-Awesome/6.x/svgs/brands/github.svg" width="20">](https://github.com/HistAI/hibou) [<img src="https://huggingface.co/datasets/huggingface/brand-assets/resolve/main/hf-logo.svg" width="25">](https://huggingface.co/histai/hibou-L)                                            |
-| **[H-optimus-0](https://www.bioptimus.com/news/bioptimus-launches-h-optimus-0-the-worlds-largest-open-source-ai-foundation-model-for-pathology)** | [Bioptimus](https://www.bioptimus.com)                                                                          | :white_check_mark: | Jul 2024[\*](https://github.com/bioptimus/releases/commit/f967dd8d6de387fc0926cbe29b35b3cc5abc5500)   | DINOv2/iBOT                                                                     | **500K** (across 4,000 clinics) | >100M    | 200K       |            |            | ViT-G with 4 registers | 1.1B       | 1536      | 224        | proprietary                                      | [<img src="https://raw.githubusercontent.com/FortAwesome/Font-Awesome/6.x/svgs/brands/github.svg" width="20">](https://github.com/bioptimus/releases/tree/main/models/h-optimus/v0) [<img src="https://huggingface.co/datasets/huggingface/brand-assets/resolve/main/hf-logo.svg" width="25">](https://huggingface.co/bioptimus/H-optimus-0) |
-| [mSTAR](https://arxiv.org/abs/2407.15362) (VL)                                                                                                    | [Smart Lab](https://hkustsmartlab.github.io)                                                                    | :x:                | Jul 2024[\*](https://arxiv.org/abs/2407.15362v1)                                                      | mSTAR (multimodal)                                                              | 10K                             |          | 10K        |            |            | ViT-L                  |            |           | 224        | TCGA                                             |                                                                                                                                                                                                                                                                                                                                              |
-| **[Virchow 2](https://arxiv.org/abs/2408.00738)**                                                                                                 | [Paige](https://paige.ai) / [Microsoft](https://www.microsoft.com/en-us/research/lab/microsoft-health-futures)  | :white_check_mark: | Aug 2024[\*](https://arxiv.org/abs/2408.00738v1)                                                      | DINOv2 (+ ECT and KDE)                                                          | **3.1M**                        | 2B       | 230K       | 4096       |            | ViT-H with 4 registers | 632M       | 3584      | 224        | proprietary (from MSKCC and international sites) | [<img src="https://huggingface.co/datasets/huggingface/brand-assets/resolve/main/hf-logo.svg" width="25">](https://huggingface.co/paige-ai/Virchow2)                                                                                                                                                                                         |
-| **[Virchow 2G](https://arxiv.org/abs/2408.00738)**                                                                                                | [Paige](https://paige.ai) / [Microsoft](https://www.microsoft.com/en-us/research/lab/microsoft-health-futures)  | :x:                | Aug 2024[\*](https://arxiv.org/abs/2408.00738v1)                                                      | DINOv2 (+ ECT and KDE)                                                          | **3.1M**                        | 2B       | 230K       | 3072       |            | ViT-G with 8 registers | 1.9B       | 3584      | 224        | proprietary (from MSKCC and international sites) |                                                                                                                                                                                                                                                                                                                                              |
-| [Phikon-v2](https://arxiv.org/abs/2409.09173)                                                                                                     | [Owkin](https://www.owkin.com)                                                                                  | :white_check_mark: | Sep 2024[\*](https://arxiv.org/abs/2409.09173v1)                                                      | DINOv2                                                                          | 58.4K                           | 456M     |            | 4096       | 250K       | ViT-L                  | 307M       | 1024      | 224        | PANCAN-XL (TCGA, CPTAC, GTEx, proprietary)       | [<img src="https://huggingface.co/datasets/huggingface/brand-assets/resolve/main/hf-logo.svg" width="25">](https://huggingface.co/owkin/phikon-v2)                                                                                                                                                                                           |
-| [MUSK](https://www.nature.com/articles/s41586-024-08378-w)<sub>V</sub> (VL)                                                                       | [Li Lab (Stanford)](https://med.stanford.edu/lilab.html)                                                        | :white_check_mark: | Jan 2025[\*](https://www.nature.com/articles/s41586-024-08378-w)                                      | Unified masked modeling (MLM, MIM) + contrastive learning                       | 33K                             | 50M      | 12K        | 2048       | 20 epochs  | BEiT3                  |            |           | 384        | TCGA                                             | [<img src="https://raw.githubusercontent.com/FortAwesome/Font-Awesome/6.x/svgs/brands/github.svg" width="20">](https://github.com/lilab-stanford/MUSK) [<img src="https://huggingface.co/datasets/huggingface/brand-assets/resolve/main/hf-logo.svg" width="25">](https://huggingface.co/xiangjx/musk)                                       |
-| **[RudolfV2](https://arxiv.org/abs/2501.05409)**                                                                                                  | [Mayo](https://www.mayoclinic.org), [Charité](https://www.charite.de), [Aignostics](https://www.aignostics.com) | :x:                | Jan 2025[\*](https://arxiv.org/abs/2501.05409v1)                                                      |                                                                                 | **1.2M**                        | 3.4B     | 490K cases |            |            | ViT-H                  | 632M       |           |            |                                                  |                                                                                                                                                                                                                                                                                                                                              |
-| **[UNI](https://www.nature.com/articles/s41591-024-02857-3)2-h**                                                                                  | [Mahmood Lab](https://faisal.ai)                                                                                | :white_check_mark: | Jan 2025[\*](https://github.com/mahmoodlab/UNI/commit/91e141ce3d8aca1be0de83a89d0caab45af6a470)       | DINOv2                                                                          | **350K**                        | 200M     |            |            |            | ViT-H with 8 registers | 681M       | 1536      | 224        | proprietary (Mass)                               | [<img src="https://raw.githubusercontent.com/FortAwesome/Font-Awesome/6.x/svgs/brands/github.svg" width="20">](https://github.com/mahmoodlab/UNI) [<img src="https://huggingface.co/datasets/huggingface/brand-assets/resolve/main/hf-logo.svg" width="25">](https://huggingface.co/MahmoodLab/UNI2-h)                                       |
-| **[UNI](https://www.nature.com/articles/s41591-024-02857-3)2-g-preview**                                                                          | [Mahmood Lab](https://faisal.ai)                                                                                | :x:                | Jan 2025[\*](https://github.com/mahmoodlab/UNI/commit/91e141ce3d8aca1be0de83a89d0caab45af6a470)       | DINOv2                                                                          | **350K**                        | 200M     |            |            |            | ViT-G                  |            |           |            | proprietary (Mass)                               | [<img src="https://raw.githubusercontent.com/FortAwesome/Font-Awesome/6.x/svgs/brands/github.svg" width="20">](https://github.com/mahmoodlab/UNI)                                                                                                                                                                                            |
+If during training you get HTTP Error 429, try reducing the number of workers (set in the YAML config) and lowering the DataLoader's `prefetch_factor` (defined in `dinov2/train/train.py`). This error can happen when Hugging Face is being pinged too frequently during streaming. Another solution is to [download the data locally](https://huggingface.co/datasets/medarc/TCGA-12K-parquet) and replace `medarc/TCGA-12K-parquet` in `dinov2/train/train.py` with the full path to your locally downloaded dataset folder.
 
+# Methods / Training Recipe
 
-Notes:
+Below is a high‑level overview of our training recipe, with particular attention to deviations from the original DINOv2 paper. For additional context, refer to the [Midnight paper](https://arxiv.org/abs/2504.05186).
 
-- Models marked with VL indicate language-vision pretraining (others are vision-only)
-- Models trained on >100K slides may be considered foundation models and are marked in **bold**
-- \# of WSIs, tiles, and patients are reported to 2 significant figures
-- INE = ImageNet epochs
-- Order is chronological
-- Some of these feature extractors have been evaluated in a benchmarking study for whole slide classification [here](https://arxiv.org/abs/2311.11772).
-- \*\* means inferred from other numbers provided in the paper
+- Base model + init
+  - Student/teacher are ViT‑G/14 with 4 register tokens.
+  - We initialize the student backbone from Meta’s DINOv2 ViT‑G/14 register checkpoint via `torch.hub`.
+  - Heads are re‑initialized, as Meta only shared pretrained weights for their model backbone.
 
-## Slide-level / patient-level models
-This table includes models that produce slide-level or patient-level embeddings without supervision.
-| Name                                                                | Group                                                                                                          | Weights            | Released                                                         | SSL                                   | WSIs                         | Patients | Batch size | Iterations       | Architecture             | Parameters | Embed dim | Patch size | Dataset                                                                        | Links                                                                                                                                                                                                                                                                                                                         |
-| ------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- | ------------------ | ---------------------------------------------------------------- | ------------------------------------- | ---------------------------- | -------- | ---------- | ---------------- | ------------------------ | ---------- | --------- | ---------- | ------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [GigaSSL](https://arxiv.org/abs/2212.03273)                         | [CBIO](https://cbio.mines-paristech.fr)                                                                        | :white_check_mark: | Dec 2022[\*](https://arxiv.org/abs/2212.03273v1)                 | SimCLR                                | 12K                          |          |            | 1K epochs        | ResNet-18                |            | 256       | 256        | TCGA                                                                           | [<img src="https://raw.githubusercontent.com/FortAwesome/Font-Awesome/6.x/svgs/brands/github.svg" width="20">](https://github.com/trislaz/gigassl)                                                                                                                                                                            |
-| [PRISM](https://arxiv.org/abs/2405.10254) (VL)                      | [Paige](https://paige.ai) / [Microsoft](https://www.microsoft.com/en-us/research/lab/microsoft-health-futures) | :white_check_mark: | May 2024[\*](https://arxiv.org/abs/2405.10254v1)                 | contrastive (with language)           | **590K** (190K text reports) | 190K     | 64 (x4)    | 75K (10 epochs)  | Perceiver + BioGPT       |            | 1280      | 224        | proprietary                                                                    | [<img src="https://huggingface.co/datasets/huggingface/brand-assets/resolve/main/hf-logo.svg" width="25">](https://huggingface.co/paige-ai/Prism)                                                                                                                                                                             |
-| [Prov-GigaPath](https://www.nature.com/articles/s41586-024-07441-w) | [Microsoft](https://www.microsoft.com/en-us/research/) / [Providence](https://www.providence.org)              | :white_check_mark: | May 2024[\*](https://www.nature.com/articles/s41586-024-07441-w) | DINOv2                                | **170K**                     | 30K      |            |                  | LongNet                  | 86M        | 1536      | 224        | proprietary (Providence)                                                       | [<img src="https://raw.githubusercontent.com/FortAwesome/Font-Awesome/6.x/svgs/brands/github.svg" width="20">](https://github.com/prov-gigapath/prov-gigapath) [<img src="https://huggingface.co/datasets/huggingface/brand-assets/resolve/main/hf-logo.svg" width="25">](https://huggingface.co/prov-gigapath/prov-gigapath) |
-| [MADELEINE](https://arxiv.org/abs/2408.02859) (VL)                  | [Mahmood Lab](https://faisal.ai)                                                                               | :white_check_mark: | Aug 2024[\*](https://arxiv.org/abs/2408.02859v1)                 | contrastive (InfoNCE & OT)            | 16K                          | 2K       | 120        | 90 epochs        | multi-head attention MIL |            | 512       | 256        | [ACROBAT](https://acrobat.grand-challenge.org/data/), BWH Kidney (proprietary) | [<img src="https://raw.githubusercontent.com/FortAwesome/Font-Awesome/6.x/svgs/brands/github.svg" width="20">](https://github.com/mahmoodlab/MADELEINE)                                                                                                                                                                       |
-| [CHIEF](https://www.nature.com/articles/s41586-024-07894-z) (VL)    | [Yu Lab](https://yulab.hms.harvard.edu)                                                                        | :white_check_mark: | Sep 2024[\*](https://www.nature.com/articles/s41586-024-07894-z) |                                       |                              |          |            |                  |                          |            |           |            |                                                                                | [<img src="https://raw.githubusercontent.com/FortAwesome/Font-Awesome/6.x/svgs/brands/github.svg" width="20">](https://github.com/hms-dbmi/CHIEF)                                                                                                                                                                             |
-| [COBRA](https://arxiv.org/abs/2411.13623)                           | [Kather Lab](https://jnkather.github.io)                                                                       | :white_check_mark: | Nov 2024[\*](https://arxiv.org/abs/2411.13623v1)                 | COBRA (MoCo-v3 in FM embedding space) | 3K                           | 2.8K     | 1024       | 2K epochs        | Mamba-2 + ABMIL          | 15M        | 768       | 224        | TCGA (BRCA, CRC, LUAD, LUSC, STAD)                                             | [<img src="https://raw.githubusercontent.com/FortAwesome/Font-Awesome/6.x/svgs/brands/github.svg" width="20">](https://github.com/KatherLab/COBRA) [<img src="https://huggingface.co/datasets/huggingface/brand-assets/resolve/main/hf-logo.svg" width="25">](https://huggingface.co/KatherLab/COBRA)                         |
-| [TITAN](https://arxiv.org/abs/2411.19666)<sub>V</sub> (VL)          | [Mahmood Lab](https://faisal.ai)                                                                               | :white_check_mark: | Dec 2024[\*](https://arxiv.org/abs/2411.19666v1)                 | iBOT                                  | **340K**                     |          | 1024       | 91K (270 epochs) | ViT (smaller)            | 42M        |           | 224        | Mass-340K (proprietary)                                                        | [<img src="https://raw.githubusercontent.com/FortAwesome/Font-Awesome/6.x/svgs/brands/github.svg" width="20">](https://github.com/mahmoodlab/TITAN) [<img src="https://huggingface.co/datasets/huggingface/brand-assets/resolve/main/hf-logo.svg" width="25">](https://huggingface.co/MahmoodLab/TITAN)                       |
-| [THREADS](https://arxiv.org/abs/2501.16652) (WSI, RNA, DNA)         | [Mahmood Lab](https://faisal.ai)                                                                               | :x:                | Jan 2025[\*](https://arxiv.org/abs/2501.16652v1)                 |                                       | 47K                          |          | 1200       | up to 101 epochs | ViT-L                    |            |           | 224        | MBTG-47k (MGH, BWH, TCGA, GTEx)                                                |                                                                                                                                                                                                                                                                                                                               |
- 
+- Objectives and heads
+  - DINO self‑distillation on CLS tokens, with 131072 prototypes and a 384‑dim bottleneck head. iBOT masked patch prediction on global crops. 
+  - DINOv2's KoLeo regularization is replaced by a KDE‑based entropy regularizer as done in the Midnight paper.
 
+- Data and augmentations
+  - Streaming directly from a Parquet dataset of pre-patched TCGA slides hosted on Hugging Face (medarc/TCGA-12K-parquet). See `prepatching_scripts/` and read our [hf dataset card](https://huggingface.co/datasets/medarc/TCGA-12K-parquet/blob/main/README.md) for more information on pre-patching. We read `image_bytes`, decode to RGB, and apply DINO augmentations.
+  - H&E augmentation: before normalization, images are converted to HED space and perturbed, then converted back to RGB. See `DataAugmentationDINO` in `dinov2/data/augmentations.py`.
+  - Multi‑crop: 2 global crops (224) and multiple local crops (98). iBOT masks are sampled per‑image with ratios drawn uniformly from a min/max range.
 
-## Modern results
-| Name  | Link | Augmentations |Dataset|
-| ------------- | ------------- |-----------|----------|
-| UNI  |https://pmc.ncbi.nlm.nih.gov/articles/PMC11403354/pdf/nihms-2015612.pdf | To augment the data, we use the large-scale jittering (LSJ) augmentation135, with a random scale sampled from a range of 0.5–2.0, followed by a fixed size crop to 896 × 896pixels to accommodate the size constraints of CTransPath. At inference time, we resize the image dimensions to their nearest multiples of 224.  |Private|
-| Virchow  | https://www.nature.com/articles/s41591-024-03141-0   |  Nothing  | Private |
-| Hibou    | https://arxiv.org/abs/2406.05074 | Nothing| Private |
-| Rudolf |https://arxiv.org/pdf/2401.04079|Data augmentation In pathology it is known that staining and scanning outputs vary between labs and even within the same lab over a given period of time. Consequently, in histopathology studies, staining and scanner informa-tion can produce spurious correlations and so-called “Clever Hans” effects [46] when correlated with label information [1]. To address this shortcoming, we transferred and augmented stain and scanner color profiles between patches in addition to the standard color augmentations in the view generation process of DINOv2 [8]. For each view, we picked a random other patch in the batch and transferred the patch color profile to the slide color statistics of the selected patch [47]. This discourages the model from exploiting staining and scanner color features for learning representations. We further added 90 degree rotations as well as horizon-tal and vertical flipping to the augmentations in DINOv2, incorporating the prior that objects on histopathological slides have no canonical orientation. Following [48, 49], we removed the solarization augmentation from the DINOv2standard augmentations. | Private|
+- Optimization and schedules
+  - LR is scaled with sqrt(batch/1024) from a base LR of 2e‑4. Midnight paper originally used a base LR of 3.5e-4 but we observed that this led to training collapse.
+  - We train for 8000 “epochs” by schedule (1 epoch = 1250 steps), but early‑stop at 200 epochs. We found early stopping was necessary to prevent worsening downstream performance with longer model training.
+
+- Checkpointing, evaluation, logging
+  - We save LOCAL_STATE_DICT FSDP checkpoints per rank and tag `last_checkpoint.rank_*` files (for resuming functionality).
+  - The teacher weights are exported every cfg.evaluation.eval_period_iterations steps to `output_dir/eval/training_<iter>/teacher_checkpoint.pth`.
+  - Weights & Biases logging is enabled with a persistent run id stored in the output directory to support resuming, in case model training gets interrupted.
+
+# Downstream Evaluation
+
+## eva Benchmarks
+
+First ensure you have a checkpoint ready to be evaluated. Place your .pth file for your teacher checkpoint in the /checkpoints folder. You can download our pretrained checkpoint here: https://huggingface.co/SophontAI/OpenMidnight/blob/main/teacher_checkpoint.pth
+
+Then, `cd` into the same `openmidnight` folder cloned from our Installation steps and clone our modified GitHub repo forked from the original [kaiko-eva](https://github.com/kaiko-ai/eva):
+
+```bash
+cd openmidnight
+source .venv/bin/activate
+git clone https://github.com/MedARC-AI/eva-probe
+```
+
+Then, install the eva framework to enable use of the `eva` command in your terminal (using `--no-deps` because the `openmidnight` virtual environment already contains the necessary packages):
+
+```bash
+uv pip install -e './eva-probe[vision]' --no-deps
+```
+
+We provide every YAML config file we used in our replication in `openmidnight/eval_configs/`. Not every dataset permits automatic downloading. For datasets like BACH that do, we automatically download the dataset when you specify `DOWNLOAD_DATA=true` when calling `eva predict_fit`. For other datasets, follow the manual download steps described in the [eva datasets documentation](https://kaiko-ai.github.io/eva/main/datasets/) and place a folder containing the dataset into `openmidnight/eva-probe/data/`. Consult each dataset's specific YAML config for details on whether automatic downloading is supported; if not, modify the config to provide the path to your dataset prior to eva benchmarking.
+
+Below are the steps for running the [BACH](https://kaiko-ai.github.io/eva/main/datasets/bach/) evaluation. If your teacher checkpoint is not stored as `openmidnight/checkpoints/teacher_epoch250000.pth`, you will first need to modify your eva YAML file's `checkpoint_path` variable to specify the path to your model weights.
+
+```bash
+cd eva-probe # should be located in openmidnight/eva-probe
+CUDA_VISIBLE_DEVICES=0 DOWNLOAD_DATA=true eva predict_fit --config ../eval_configs/bach.yaml 
+```
+
+All eva evaluations should be run on a single GPU by setting `CUDA_VISIBLE_DEVICES=0`. We observed inconsistent and worse results when trying to evaluate using multiple GPUs.
+
+## HEST Benchmark
+
+First ensure you have a checkpoint ready to be evaluated. Place the .pth file for your teacher model in the /checkpoints folder. You can download our pretrained checkpoint here: *insert URL here*
+
+Then, `cd` into the same `openmidnight` folder cloned from our Installation steps and clone the [Mahmood Lab's HEST GitHub repo](https://github.com/mahmoodlab/HEST):
+
+```bash
+cd openmidnight
+source .venv/bin/activate
+git clone https://github.com/mahmoodlab/HEST.git
+cd HEST
+git checkout afd42c3143092c51e6bcc0f1df65bbf58a467e5e
+cd .. # cd back to openmidnight/ for subsequent install steps
+```
+
+Then install HEST framework so that we can import invoke their benchmark function  (using `--no-deps` because the `openmidnight` virtual environment already contains the necessary packages).
+
+```bash
+uv pip install -e ./HEST --no-deps
+```
+
+Now uncomment out specific lines in the HEST YAML config to enable PCA dimensionality reduction, benchmark across all HEST datasets used in the original paper, and solely benchmark our DINOv2 model as the encoder:
+
+```bash
+sed -i -E '/^datasets:/,/^\]/{s/^([[:space:]]*)#([[:space:]]*)"([^"]+)",/\1"\3",/;s/^([[:space:]]*)"HCC"(,?)/\1# "HCC"\2/}; s/^[[:space:]]*#([[:space:]]*dimreduce:[[:space:]]*".*")/\1/; /^encoders:/,/^\]/{s/^([[:space:]]*)"resnet50"(,?)/\1# "resnet50"\2/}' ./HEST/bench_config/bench_config.yaml
+```
+
+Then finally run our HEST_evaluation.py script to benchmark your checkpoint. Running HEST_evaluation.py will automatically download the necessary preprocessed patches and patch encoders and output results into a new `openmidnight/eval` folder (specifically, the benchmark results dump to the `ST_pred_results/` subfolder).
+
+```bash
+python HEST_evaluation.py
+```
+
+## Related Work / Citation
+
+This repository adapts and extends Meta AI's DINOv2 codebase and follows modifications introduced by Kaiko's Midnight work. If you use this repository or models in academic work, please cite their and our work:
+
+Kaplan, D., Grandhi, R. S., Lane, C., Warner, B., Abraham, T. M., & Scotti, P. S. (2025). How to train a state-of-the-art pathology foundation model with $1.6k. Sophont. https://sophont.med/blog/openmidnight
+
+```
+@article{kaplan2025openmidnight,
+            author = {Kaplan, Daniel and Grandhi, Ratna Sagari and Lane, Connor and Warner, Benjamin and Abraham, Tanishq Mathew and Scotti, Paul S.},
+            title = {How to Train a State-of-the-Art Pathology Foundation Model with \$1.6k},
+            year = {2025},
+            url = {https://sophont.med/blog/openmidnight},
+          }
+```
+
+Karasikov, M., van Doorn, J., Känzig, N., Erdal Cesur, M., Horlings, H. M., Berke, R., ... & Otálora, S. (2025). Training state-of-the-art pathology foundation models with orders of magnitude less data. In International Conference on Medical Image Computing and Computer-Assisted Intervention (pp. 573-583). Cham: Springer Nature Switzerland.
+
+```
+@inproceedings{karasikov2025training,
+  title={Training state-of-the-art pathology foundation models with orders of magnitude less data},
+  author={Karasikov, Mikhail and van Doorn, Joost and K{\"a}nzig, Nicolas and Erdal Cesur, Melis and Horlings, Hugo Mark and Berke, Robert and Tang, Fei and Ot{\'a}lora, Sebastian},
+  booktitle={International Conference on Medical Image Computing and Computer-Assisted Intervention},
+  pages={573—583},
+  year={2025},
+  organization={Springer}
+}
+```
+
+Oquab, M., Darcet, T., Moutakanni, T., Vo, H., Szafraniec, M., Khalidov, V., ... & Bojanowski, P. (2023). DINOv2: Learning robust visual features without supervision. arXiv preprint arXiv:2304.07193.
+
+```
+@article{oquab2023dinov2,
+            title={DINOv2: Learning Robust Visual Features without Supervision}, 
+            author={Maxime Oquab and Timothée Darcet and Théo Moutakanni and Huy Vo and Marc Szafraniec and Vasil Khalidov and Pierre Fernandez and Daniel Haziza and Francisco Massa and Alaaeldin El-Nouby and Mahmoud Assran and Nicolas Ballas and Wojciech Galuba and Russell Howes and Po-Yao Huang and Shang-Wen Li and Ishan Misra and Michael Rabbat and Vasu Sharma and Gabriel Synnaeve and Hu Xu and Hervé Jegou and Julien Mairal and Patrick Labatut and Armand Joulin and Piotr Bojanowski},
+            year={2024},
+            eprint={2304.07193},
+            archivePrefix={arXiv},
+            primaryClass={cs.CV},
+            url={https://arxiv.org/abs/2304.07193}, 
+}
+```
+
