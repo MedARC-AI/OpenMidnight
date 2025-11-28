@@ -14,9 +14,13 @@ from io import BytesIO
 from pathlib import Path
 import gc
 import contextlib
+import pickle
+import numpy as np
 
 from fvcore.common.checkpoint import PeriodicCheckpointer
 import torch
+import timm
+import timm.optim
 
 from dinov2.data import collate_data_and_cast, DataAugmentationDINO, MaskingGenerator
 import dinov2.distributed as distributed
@@ -33,10 +37,6 @@ import torch.utils.data
 import pyarrow
 import pyarrow.dataset
 import torch.distributed as dist
-
-import pyarrow
-import pyarrow.dataset
-import torch.distributed as dist
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
     StateDictType,
@@ -46,6 +46,12 @@ from torch.distributed.fsdp import (
 torch.backends.cuda.matmul.allow_tf32 = True  # PyTorch 1.12 sets this to False by default
 logger = logging.getLogger("dinov2")
 import wandb
+
+def oom_observer(device, alloc, device_alloc, device_free):
+    # snapshot right after an OOM happened
+    print('saving allocated state during OOM')
+    snapshot = torch.cuda.memory._snapshot()
+    pickle.dump(snapshot, open('oom_snapshot.pickle', 'wb'))
 
 def _build_streaming_dataset(
     dataset_path: str,
@@ -114,7 +120,13 @@ For python-based LazyConfig, use "path.key=value".
 
 
 def build_optimizer(cfg, params_groups):
-    return torch.optim.AdamW(params_groups, betas=(cfg.optim.adamw_beta1, cfg.optim.adamw_beta2))
+    # SimDINO uses timm.optim for flexibility, fallback to original if not specified
+    if hasattr(cfg.optim, 'opt') and cfg.optim.opt:
+        opt_lower = cfg.optim.opt.lower()
+        kwargs = getattr(cfg.optim, 'kwargs', {})
+        return timm.optim.create_optimizer_v2(params_groups, opt=opt_lower, **kwargs)
+    else:
+        return torch.optim.AdamW(params_groups, betas=(cfg.optim.adamw_beta1, cfg.optim.adamw_beta2))
 
 
 def build_schedulers(cfg):
@@ -143,16 +155,23 @@ def build_schedulers(cfg):
         warmup_iters=cfg.teacher["warmup_teacher_temp_epochs"] * OFFICIAL_EPOCH_LENGTH,
         start_warmup_value=cfg.teacher["warmup_teacher_temp"],
     )
+    
+    # SimDINO schedules
+    clip_grad = dict(
+        base_value=cfg.optim.clip_grad,
+        final_value=getattr(cfg.optim, "clip_grad_end", cfg.optim.clip_grad),
+        total_iters=cfg.optim["epochs"] * OFFICIAL_EPOCH_LENGTH,
+    )
 
     lr_schedule = CosineScheduler(**lr)
     wd_schedule = CosineScheduler(**wd)
     momentum_schedule = CosineScheduler(**momentum)
     teacher_temp_schedule = CosineScheduler(**teacher_temp)
     last_layer_lr_schedule = CosineScheduler(**lr)
+    clip_grad_schedule = CosineScheduler(**clip_grad)
 
-    last_layer_lr_schedule.schedule[
-        : cfg.optim["freeze_last_layer_epochs"] * OFFICIAL_EPOCH_LENGTH
-    ] = 0  # mimicking the original schedules
+    # REMOVED: Direct attribute access last_layer_lr_schedule.schedule[...] = 0
+    # Logic moved to do_train loop to be robust against CosineScheduler implementation differences.
 
     logger.info("Schedulers ready.")
 
@@ -162,6 +181,7 @@ def build_schedulers(cfg):
         momentum_schedule,
         teacher_temp_schedule,
         last_layer_lr_schedule,
+        clip_grad_schedule
     )
 
 
@@ -232,6 +252,7 @@ def do_train(cfg, model, resume=False):
         momentum_schedule,
         teacher_temp_schedule,
         last_layer_lr_schedule,
+        clip_grad_schedule
     ) = build_schedulers(cfg)
     
     from omegaconf import OmegaConf
@@ -251,13 +272,6 @@ def do_train(cfg, model, resume=False):
             id=run_id,
             resume=resume_mode,
         )
-        repo_root = Path(__file__).resolve().parents[2]
-        artifact = wandb.Artifact(name=f"run-source-{run.id}", type="code")
-        artifact.add_file(str(Path(__file__).resolve()))
-
-        artifact.add_file(str(os.environ.get("DINOV2_RUN_SCRIPT")))
-        artifact.add_file(str(Path(CONFIG_FILE_PATH)))
-        run.log_artifact(artifact)
 
     # checkpointer
     if not single_gpu_run:
@@ -270,6 +284,9 @@ def do_train(cfg, model, resume=False):
     max_iter = cfg.optim.epochs * OFFICIAL_EPOCH_LENGTH
     early_stop_iter = cfg.optim.early_stop * OFFICIAL_EPOCH_LENGTH
     eta_target_iter = min(max_iter, early_stop_iter)
+    
+    # Calculate freeze iterations for last layer
+    freeze_last_layer_iters = cfg.optim["freeze_last_layer_epochs"] * OFFICIAL_EPOCH_LENGTH
 
     if not single_gpu_run:
         periodic_checkpointer = PeriodicCheckpointer(
@@ -411,7 +428,7 @@ def do_train(cfg, model, resume=False):
             shuffle=True,
             seed=0,
             sampler_type=sampler_type,
-            sampler_advance=0,  # TODO(qas): fix this -- start_iter * cfg.train.batch_size_per_gpu,
+            sampler_advance=0,
             drop_last=True,
             collate_fn=collate_fn,
         )
@@ -449,17 +466,28 @@ def do_train(cfg, model, resume=False):
         nan_mask2 = torch.isnan(data["collated_local_crops"])
         if nan_mask.any():
             print("found nan in input data")
-            print(data[indexes])
         
 
         # apply schedules
-
         lr = lr_schedule[iteration]
         wd = wd_schedule[iteration]
         mom = momentum_schedule[iteration]
         teacher_temp = teacher_temp_schedule[iteration]
-        last_layer_lr = last_layer_lr_schedule[iteration]
+        
+        # Logic to freeze last layer (set LR to 0)
+        if iteration < freeze_last_layer_iters:
+            last_layer_lr = 0
+        else:
+            last_layer_lr = last_layer_lr_schedule[iteration]
+        
         apply_optim_scheduler(optimizer, lr, wd, last_layer_lr)
+
+        # Dynamic Patch Sizing (SimDINO Feature)
+        patch_size_seq = getattr(cfg.student, "patch_size_seq", None)
+        if patch_size_seq:
+            new_patch_size = np.random.choice(patch_size_seq)
+            model.student.backbone.patch_embed.update_patch_size(new_patch_size)
+            model.teacher.backbone.patch_embed.update_patch_size(new_patch_size)
 
         # compute losses
 
@@ -468,18 +496,18 @@ def do_train(cfg, model, resume=False):
         loss_dict = model.forward_backward(data, teacher_temp=teacher_temp)
 
         # clip gradients
-
+        clip_grad_val = clip_grad_schedule[iteration]
         if fp16_scaler is not None:
-            if cfg.optim.clip_grad:
+            if clip_grad_val > 0:
                 fp16_scaler.unscale_(optimizer)
                 for v in model.student.values():
-                    v.clip_grad_norm_(cfg.optim.clip_grad)
+                    v.clip_grad_norm_(clip_grad_val)
             fp16_scaler.step(optimizer)
             fp16_scaler.update()
         else:
-            if cfg.optim.clip_grad:
+            if clip_grad_val > 0:
                 for v in model.student.values():
-                    v.clip_grad_norm_(cfg.optim.clip_grad)
+                    v.clip_grad_norm_(clip_grad_val)
             optimizer.step()
 
         # perform teacher EMA update
@@ -496,7 +524,6 @@ def do_train(cfg, model, resume=False):
         if math.isnan(sum(loss_dict_reduced.values())):
             print(sum(loss_dict_reduced.values()))
             logger.info("NaN detected")
-            print(data["indexes"])
             
             for name, param in model.named_parameters():
                 if torch.isnan(param.data).any():
@@ -589,8 +616,16 @@ def main(args):
                         sublayer.mlp.w12.bias = current.mlp.w12.bias
                         sublayer.mlp.w3.weight = current.mlp.w3.weight
                         sublayer.mlp.w3.bias = current.mlp.w3.bias
-                    sublayer.ls1.gamma = current.ls1.gamma
-                    sublayer.ls2.gamma = current.ls2.gamma
+                    
+                    # Compatibility with standard checkpoints:
+                    # If current has ls1/ls2 gamma, assign to our layerscale
+                    # NOTE: Our block expects ls1/ls2 to be LayerScale objects or Identity.
+                    # If Identity, we can't load gamma. But we initialized with layerscale=1e-5 (default)
+                    # so they should be LayerScale objects.
+                    if hasattr(sublayer, 'ls1') and hasattr(current, 'ls1') and hasattr(sublayer.ls1, 'gamma'):
+                        sublayer.ls1.gamma = current.ls1.gamma
+                    if hasattr(sublayer, 'ls2') and hasattr(current, 'ls2') and hasattr(sublayer.ls2, 'gamma'):
+                        sublayer.ls2.gamma = current.ls2.gamma
 
 
         model.student.backbone.norm.weight = model_pretrained.norm.weight
@@ -607,6 +642,11 @@ def main(args):
             + 1
         )
         return do_test(cfg, model, f"manual_{iteration}")
+
+    if getattr(args, 'debug', False) and distributed.is_main_process():
+        logger.info("DEBUG MODE ENABLED: Recording Memory History")
+        torch.cuda.memory._record_memory_history()
+        torch._C._cuda_attach_out_of_memory_observer(oom_observer)
 
     do_train(cfg, model, resume=not args.no_resume)
 
