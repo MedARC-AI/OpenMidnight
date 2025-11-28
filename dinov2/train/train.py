@@ -17,6 +17,8 @@ import contextlib
 
 from fvcore.common.checkpoint import PeriodicCheckpointer
 import torch
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+from torch.utils.checkpoint import create_selective_checkpoint_contexts
 
 from dinov2.data import collate_data_and_cast, DataAugmentationDINO, MaskingGenerator
 import dinov2.distributed as distributed
@@ -179,6 +181,30 @@ def apply_optim_scheduler(optimizer, lr, wd, last_layer_lr):
         param_group["lr"] = (last_layer_lr if is_last_layer else lr) * lr_multiplier
 
 _FULL_STATE_DICT_CFG = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+
+
+def _enable_activation_checkpointing(backbone, full_checkpoint):
+    blocks = getattr(backbone, "blocks", None)
+    if blocks is None:
+        raise AssertionError("activation checkpointing expects backbone.blocks")
+    if full_checkpoint:
+        wrapper = checkpoint_wrapper
+    else:
+        _save_list = [
+            torch.ops.aten.mm.default,
+            torch.ops.aten._scaled_mm.default,
+            torch.ops.aten._scaled_dot_product_efficient_attention.default,
+            torch.ops.aten._scaled_dot_product_flash_attention.default,
+            torch.ops._c10d_functional.reduce_scatter_tensor.default,
+        ]
+        wrapper = partial(
+            checkpoint_wrapper,
+            context_fn=partial(create_selective_checkpoint_contexts, _save_list),
+            preserve_rng_state=True,
+        )
+    for i, block in enumerate(blocks):
+        blocks[i] = wrapper(block)
+
 
 def do_test(cfg, model, iteration): # save teacher checkpoint (used for eval only)
     # All ranks participate in FSDP state_dict() even with rank0_only=True
@@ -784,7 +810,7 @@ def main(args):
                 mp.reduce_dtype = "bf16"
                 mp.buffer_dtype = "fp32"
     print(cfg)
-    model = SSLMetaArch(cfg).to(torch.device("cuda"))
+    model = SSLMetaArch(cfg)
     #Load model here from pretrained.
     if cfg.train.use_pretrained:
 
@@ -878,6 +904,16 @@ def main(args):
             model.teacher.backbone.load_state_dict(backbone_state, strict=True)
         else:
             raise AssertionError("pretrained loading only supports vit_giant2, vit_huge2, or vit_7b")
+
+    if getattr(cfg.train, "checkpointing", False):
+        _enable_activation_checkpointing(
+            model.student.backbone,
+            full_checkpoint=getattr(cfg.train, "checkpointing_full", False),
+        )
+        _enable_activation_checkpointing(
+            model.teacher.backbone,
+            full_checkpoint=getattr(cfg.train, "checkpointing_full", False),
+        )
 
     model.prepare_for_distributed_training()
     logger.info("Model:\n{}".format(model))

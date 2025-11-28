@@ -21,13 +21,15 @@ train:
   OFFICIAL_EPOCH_LENGTH: 1250
   num_workers: 10
   pretrained_teacher_ckpt: /home/paul/dinov3/checkpoints/dinov3_vit7b16_saved_teacher.pth
+  checkpointing: true # enable to save memory
+  checkpointing_full: false  # requires checkpointing also be true; more aggressive checkpointing
 student:
   arch: vit_7b
   patch_size: 16
   drop_path_rate: 0.3
   layerscale: 1.0e-05
-  ffn_layer: swiglu
-  ffn_ratio: 6.0
+  ffn_layer: swiglu64
+  ffn_ratio: 3.0
   norm_layer: layernormbf16
   n_storage_tokens: 4
   mask_k_bias: true
@@ -50,4 +52,4 @@ optim:
 crops:
   local_crops_size: 98
 evaluation:
-  eval_period_iterations: 2500 # save checkpoint every 2 epochs
+  eval_period_iterations: 20 #2500 # save checkpoint every 2 epochs

@@ -28,6 +28,16 @@ except ImportError:
 logger = logging.getLogger("dinov2")
 
 
+def _fsdp_wrap_targets_for_backbone(backbone):
+    blocks = getattr(backbone, "blocks", None)
+    if blocks is None or len(blocks) == 0:
+        raise AssertionError("backbone.blocks must exist for FSDP wrapping")
+    first_block = blocks[0]
+    if isinstance(first_block, BlockChunk):
+        return {BlockChunk}
+    return {type(first_block)}
+
+
 class SSLMetaArch(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -413,6 +423,7 @@ class SSLMetaArch(nn.Module):
         for k, v in self.student.items():
             self.teacher[k].load_state_dict(self.student[k].state_dict())
             student_model_cfg = self.cfg.compute_precision.student[k]
-            self.student[k] = get_fsdp_wrapper(student_model_cfg, modules_to_wrap={BlockChunk})(self.student[k])
+            wrap_targets = _fsdp_wrap_targets_for_backbone(self.student[k]) if k == "backbone" else set()
+            self.student[k] = get_fsdp_wrapper(student_model_cfg, modules_to_wrap=wrap_targets)(self.student[k])
             teacher_model_cfg = self.cfg.compute_precision.teacher[k]
-            self.teacher[k] = get_fsdp_wrapper(teacher_model_cfg, modules_to_wrap={BlockChunk})(self.teacher[k])
+            self.teacher[k] = get_fsdp_wrapper(teacher_model_cfg, modules_to_wrap=wrap_targets)(self.teacher[k])
