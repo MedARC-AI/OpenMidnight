@@ -15,7 +15,7 @@ ibot:
   head_nlayers: 3
 train:
   streaming_from_hf: False
-  batch_size_per_gpu: 8
+  batch_size_per_gpu: 32
   centering: sinkhorn_knopp
   use_pretrained: True
   OFFICIAL_EPOCH_LENGTH: 1250
@@ -32,7 +32,9 @@ student:
   ffn_ratio: 3.0
   norm_layer: layernormbf16
   n_storage_tokens: 4
+  qkv_bias: false
   mask_k_bias: true
+  untie_global_and_local_cls_norm: true
   pos_embed_rope_rescale_coords: 2.0
   pos_embed_rope_dtype: fp32
 teacher:
