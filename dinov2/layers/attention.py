@@ -90,10 +90,8 @@ class Attention(nn.Module):
             attn = attn.softmax(dim=-1)
             attn = self.attn_drop(attn)
             x = attn @ v
-        x = x.transpose(1, 2)
-        x = x.reshape(B, N, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
+        x = x.transpose(1, 2).contiguous().view(B, N, C)
+        x = self.proj_drop(self.proj(x))
         return x
 
 class MemEffAttention(Attention):

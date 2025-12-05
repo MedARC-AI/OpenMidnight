@@ -195,13 +195,6 @@ class DinoVisionTransformer(nn.Module):
         nn.init.normal_(self.cls_token, std=1e-6)
         if self.register_tokens is not None:
             nn.init.normal_(self.register_tokens, std=1e-6)
-            
-        def init_weights_vit_timm(module: nn.Module, name: str = ""):
-            """ViT weight initialization, original timm impl (for reproducibility)"""
-            if isinstance(module, nn.Linear):
-                trunc_normal_(module.weight, std=0.02)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
         named_apply(init_weights_vit_timm, self)
 
     def interpolate_pos_encoding(self, x, w, h):
@@ -368,67 +361,13 @@ class DinoVisionTransformer(nn.Module):
         else:
             return self.head(ret["x_norm_clstoken"])
 
-    @torch.inference_mode()
-    def forward_vis(self, x, vit_feat="k", depth=1):
-        feat_out = {}
-        def hook_fn_forward_input0(module, input, output, name="output"):
-            feat_out[name] = input[0]
-        def hook_fn_forward_output(module, input, output, name="output"):
-            feat_out[name] = output
-        if self.block_chunks > 0:
-            module = self.blocks[-1-depth // self.block_chunks][-(depth%self.block_chunks)]
-            print(f"module: model.blocks{-1-depth // self.block_chunks}.{-(depth%self.block_chunks)}")
-        else:
-            module = self.blocks[-depth]
-        if vit_feat == "module":
-            module.attn.register_forward_hook(partial(hook_fn_forward_output, name="attn"))
-            module.mlp.register_forward_hook(partial(hook_fn_forward_output, name="mlp"))
-            module.norm1.register_forward_hook(partial(hook_fn_forward_output, name="norm1"))
-            module.norm2.register_forward_hook(partial(hook_fn_forward_output, name="norm2"))
-            module.norm2.register_forward_hook(partial(hook_fn_forward_input0, name="attnres"))
-            module.register_forward_hook(partial(hook_fn_forward_output, name="block"))
-            module.attn.attn_drop.register_forward_hook(partial(hook_fn_forward_output, name="attn_map"))
-        elif vit_feat == "attn":
-            module.attn.register_forward_hook(hook_fn_forward_output)
-        elif vit_feat == "attn_map":
-            module.attn.attn_drop.register_forward_hook(hook_fn_forward_output)
-        elif vit_feat == "mlp":
-            module.mlp.register_forward_hook(hook_fn_forward_output)
-        elif vit_feat == "norm1":
-            module.norm1.register_forward_hook(hook_fn_forward_output)
-        elif vit_feat == "norm2":
-            module.norm2.register_forward_hook(hook_fn_forward_output)
-        else:
-            module.attn.qkv.register_forward_hook(hook_fn_forward_output)
 
-        # Forward pass in the model
-        bs, _, h, w = x.shape
-        feat_h, feat_w = h // self.patch_size, w // self.patch_size
-        num_patches = feat_h * feat_w
-        self.forward_features(x)
-        if vit_feat == "module":
-            return feat_out
-        elif vit_feat not in ["k", "q", "v", "kqv"]:
-            return feat_out["output"]
-        # print("feat out shape:", feat_out["qkv"].shape)
-        qkv = (
-                feat_out["output"][:, self.num_tokens + self.num_register_tokens:]
-                .reshape(bs, num_patches, 3, -1)
-            )
-        q, k, v = qkv.unbind(dim=2) #B, N, C
-
-        # Modality selection
-        if vit_feat == "k":
-            feats = k
-        elif vit_feat == "q":
-            feats = q
-        elif vit_feat == "v":
-            feats = v
-        elif vit_feat == "kqv":
-            feats = torch.cat([k, q, v], dim=-1)
-        return feats.transpose(1, 2)
-
-
+def init_weights_vit_timm(module: nn.Module, name: str = ""):
+    """ViT weight initialization, original timm impl (for reproducibility)"""
+    if isinstance(module, nn.Linear):
+        trunc_normal_(module.weight, std=0.02)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
 
 def vit_small(patch_size=16, num_register_tokens=0, block="nested", **kwargs):
     model = DinoVisionTransformer(
@@ -497,15 +436,3 @@ def get_block_fn(block):
         case "base":
             return partial(Block, attn_class=Attention)
     raise ValueError(f"Unkown block type: {block}")
-
-if __name__ == "__main__":
-    #table for all models with params, embed, depth, heads, mlp_ratio
-    models = [x for x in dir() if x.startswith("vit_")]
-    from prettytable import PrettyTable
-    table = PrettyTable(["Model", "Params", "Embed", "Depth", "Heads", "MLP Ratio"])
-    for key in models:
-        model = vars()[key]()
-        #print(f"Model: {key}, Params: {sum(p.numel() for p in model.parameters())}, Embed: {model.embed_dim}, Depth: {model.n_blocks}, Heads: {model.num_heads}, MLP Ratio: {model.mlp_ratio}")
-        table.add_row([key, sum(p.numel() for p in model.parameters()), model.embed_dim, model.n_blocks, model.num_heads, model.mlp_ratio])
-    table._rows.sort(key=lambda x: x[1])
-    print(table)
