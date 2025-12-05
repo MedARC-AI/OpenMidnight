@@ -21,6 +21,7 @@ def _make_dinov2_model(
     img_size: int = 518,
     patch_size: int = 14,
     init_values: float = 1.0,
+    layerscale_offset: float = None,
     ffn_layer: str = "mlp",
     block_chunks: int = 0,
     num_register_tokens: int = 0,
@@ -42,7 +43,8 @@ def _make_dinov2_model(
     vit_kwargs = dict(
         img_size=img_size,
         patch_size=patch_size,
-        init_values=init_values,
+        layerscale=init_values,
+        layerscale_offset=layerscale_offset,
         ffn_layer=ffn_layer,
         block_chunks=block_chunks,
         num_register_tokens=num_register_tokens,
