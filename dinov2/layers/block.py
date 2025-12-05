@@ -217,18 +217,6 @@ def drop_add_residual_stochastic_depth(
 
 
 def get_indexs_scales(x, sample_drop_ratio=0.0):
-    """
-    Computes a subset of batch indices and a residual scale factor based on the given sample drop ratio.
-
-    Args:
-        x (torch.Tensor): Input tensor of shape (b, n, d), where b is the batch size, n is the sequence length, and d is the feature dimension.
-        sample_drop_ratio (float, optional): The ratio of samples to drop. Default is 0.0.
-
-    Returns:
-        tuple: A tuple containing:
-            - keep_index (torch.Tensor): A tensor of selected batch indices.
-            - residual_scale_factor (float): The scale factor to adjust for the reduced batch size.
-    """
     b, n, d = x.shape
     sample_subset_size = max(int(b * (1 - sample_drop_ratio)), 1)
     keep_index = (torch.randperm(b, device=x.device))[:sample_subset_size]
@@ -237,19 +225,6 @@ def get_indexs_scales(x, sample_drop_ratio=0.0):
 
 
 def add_residual(x, keep_index, residual, residual_scale_factor, scaling_vector=None):
-    """
-    Adds a residual to the input tensor `x` with optional scaling.
-
-    Parameters:
-    x (torch.Tensor): The input tensor to which the residual will be added.
-    keep_index (torch.Tensor): The indices at which to add the residual.
-    residual (torch.Tensor): The residual tensor to be added to `x`.
-    residual_scale_factor (float): A scaling factor applied to the residual before addition.
-    scaling_vector (torch.Tensor, optional): An optional scaling vector applied to the residual. Defaults to None.
-
-    Returns:
-    torch.Tensor: The tensor resulting from adding the scaled residual to `x`.
-    """
     if scaling_vector is None:
         x_flat = x.flatten(1)
         residual = residual.flatten(1)
@@ -275,9 +250,6 @@ attn_bias_cache: Dict[Tuple, Any] = {}
 
 
 def get_attn_bias_and_cat(x_list, keep_indexs=None):
-    """
-    this will perform the index select, cat the tensors, and provide the attn_bias from cache
-    """
     batch_sizes = (
         [b.shape[0] for b in keep_indexs]
         if keep_indexs is not None
@@ -310,17 +282,15 @@ def drop_add_residual_stochastic_depth_list(
     sample_drop_ratio: float = 0.0,
     scaling_vector=None,
 ) -> Tensor:
-    # 1) generate random set of indices for dropping samples in the batch
+
     keep_indexs_scales = [
         get_indexs_scales(x, sample_drop_ratio=sample_drop_ratio) for x in x_list
     ]
     keep_indexs = [s[0] for s in keep_indexs_scales]
     residual_scale_factors = [s[1] for s in keep_indexs_scales]
 
-    # 2) get attention bias and index+concat the tensors
     attn_bias, x_cat = get_attn_bias_and_cat(x_list, keep_indexs)
 
-    # 3) apply residual_func to get residual, and split the result
     residual_list = attn_bias.split(residual_func(x_cat, attn_bias=attn_bias))  # type: ignore
 
     outputs = []
@@ -347,19 +317,16 @@ class NestedTensorBlock(Block):
             ls1 = ls2 = None
             if isinstance(self.ls1, LayerScale):
                 ls1 = self.ls1.gamma
-            
-            # Removed OffsetLayerScale checks to fix NameError
-            
             x_list = drop_add_residual_stochastic_depth_list(
                 x_list,
                 residual_func=attn_residual_func,
                 sample_drop_ratio=self.sample_drop_ratio,
                 scaling_vector=ls1,
             )
-            
+
             if isinstance(self.ls2, LayerScale):
                 ls2 = self.ls2.gamma
-                
+
             x_list = drop_add_residual_stochastic_depth_list(
                 x_list,
                 residual_func=ffn_residual_func,
