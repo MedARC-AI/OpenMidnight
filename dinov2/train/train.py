@@ -83,9 +83,11 @@ def _build_streaming_dataset(
         fragment_scan_options=fragment_scan_options,
     )["train"]
 
+    # 1) shard first to avoid cross-rank duplication and wasted I/O
     if world_size > 1:
         ds = ds.shard(num_shards=world_size, index=global_rank)
 
+    # 2) then shuffle; vary by epoch and rank
     seed = base_seed + epoch * 1_000_000 + global_rank * 10000
     ds = ds.shuffle(buffer_size=shuffle_buffer, seed=seed)
     return ds
@@ -93,13 +95,33 @@ def _build_streaming_dataset(
 def get_args_parser(add_help: bool = True):
     parser = argparse.ArgumentParser("DINOv2 training", add_help=add_help)
     parser.add_argument("--config-file", default="", metavar="FILE", help="path to config file")
-    parser.add_argument("--no-resume", action="store_true", help="Whether to not attempt to resume from the checkpoint directory.")
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Whether to not attempt to resume from the checkpoint directory. ",
+    )
     parser.add_argument("--eval-only", action="store_true", help="perform evaluation only")
     parser.add_argument("--eval", type=str, default="", help="Eval type to perform")
-    parser.add_argument("opts", help="Modify config options", default=None, nargs=argparse.REMAINDER)
-    parser.add_argument("--output-dir", "--output_dir", default="", type=str, help="Output directory")
-    parser.add_argument("--debug", action="store_true", help="Enable debug mode")
+    parser.add_argument(
+        "opts",
+        help="""
+Modify config options at the end of the command. For Yacs configs, use
+space-separated "PATH.KEY VALUE" pairs.
+For python-based LazyConfig, use "path.key=value".
+        """.strip(),
+        default=None,
+        nargs=argparse.REMAINDER,
+    )
+    parser.add_argument(
+        "--output-dir",
+        "--output_dir",
+        default="",
+        type=str,
+        help="Output directory to save logs and checkpoints",
+    )
+
     return parser
+
 
 def build_optimizer(cfg, params_groups):
     # SimDINO Logic: Use timm.optim if specified
@@ -110,31 +132,26 @@ def build_optimizer(cfg, params_groups):
     else:
         return torch.optim.AdamW(params_groups, betas=(cfg.optim.adamw_beta1, cfg.optim.adamw_beta2))
 
+
 def build_schedulers(cfg):
-    # SimDINO Schedulers
     OFFICIAL_EPOCH_LENGTH = cfg.train.OFFICIAL_EPOCH_LENGTH
-    
-    # Basic LR
     lr = dict(
         base_value=cfg.optim["lr"],
         final_value=cfg.optim["min_lr"],
         total_iters=cfg.optim["epochs"] * OFFICIAL_EPOCH_LENGTH,
         warmup_iters=cfg.optim["warmup_epochs"] * OFFICIAL_EPOCH_LENGTH,
-        start_warmup_value=0, # Standard DINO usually 0, SimDINO might use min_lr
+        start_warmup_value=0,
     )
-    # Weight Decay
     wd = dict(
         base_value=cfg.optim["weight_decay"],
         final_value=cfg.optim["weight_decay_end"],
         total_iters=cfg.optim["epochs"] * OFFICIAL_EPOCH_LENGTH,
     )
-    # Momentum
     momentum = dict(
         base_value=cfg.teacher["momentum_teacher"],
         final_value=cfg.teacher["final_momentum_teacher"],
         total_iters=cfg.optim["epochs"] * OFFICIAL_EPOCH_LENGTH,
     )
-    # Teacher Temp
     teacher_temp = dict(
         base_value=cfg.teacher["teacher_temp"],
         final_value=cfg.teacher["teacher_temp"],
@@ -198,8 +215,6 @@ def build_schedulers(cfg):
     wd_schedule = CosineScheduler(**wd)
     momentum_schedule = CosineScheduler(**momentum)
     teacher_temp_schedule = CosineScheduler(**teacher_temp)
-    # freeze_cut_iters handles the "schedule" attribute logic internally in CosineScheduler
-    # Standard initialization (freezing logic handled manually in training loop)
     last_layer_lr_schedule = CosineScheduler(**lr)
     mcr_coeff_schedule = CosineScheduler(**coeff)
     mcr_eps_schedule = CosineScheduler(**eps_schedule)
@@ -220,6 +235,7 @@ def build_schedulers(cfg):
         clip_grad_schedule,
     )
 
+
 def apply_optim_scheduler(optimizer, lr, wd, last_layer_lr):
     for param_group in optimizer.param_groups:
         is_last_layer = param_group["is_last_layer"]
@@ -230,7 +246,8 @@ def apply_optim_scheduler(optimizer, lr, wd, last_layer_lr):
 
 _FULL_STATE_DICT_CFG = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
 
-def do_test(cfg, model, iteration):
+def do_test(cfg, model, iteration): # save teacher checkpoint (used for eval only)
+    # All ranks participate in FSDP state_dict() even with rank0_only=True
     is_main = distributed.is_main_process()
     iterstring = str(iteration)
     eval_dir = os.path.join(cfg.train.output_dir, "eval", iterstring)
@@ -269,12 +286,15 @@ def do_test(cfg, model, iteration):
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
 
+
 def do_train(cfg, model, resume=False):
     model.train()
     inputs_dtype = torch.half
-    fp16_scaler = model.fp16_scaler
+    fp16_scaler = model.fp16_scaler  # for mixed precision training
     single_gpu_run = distributed.get_global_size() <= 1
     if single_gpu_run: print("\n\nSINGLE GPU RUN, SKIPPING FSDP CHECKPOINTING\n\n")
+
+    # setup optimizer
 
     optimizer = build_optimizer(cfg, model.get_params_groups())
     
@@ -308,14 +328,18 @@ def do_train(cfg, model, resume=False):
             id=run_id,
             resume=resume_mode,
         )
+        repo_root = Path(__file__).resolve().parents[2]
+        artifact = wandb.Artifact(name=f"run-source-{run.id}", type="code")
+        artifact.add_file(str(Path(__file__).resolve()))
 
+        artifact.add_file(str(os.environ.get("DINOV2_RUN_SCRIPT")))
+        artifact.add_file(str(Path(CONFIG_FILE_PATH)))
+        run.log_artifact(artifact)
+
+    # checkpointer
     if not single_gpu_run:
         checkpointer = FSDPCheckpointer(model, cfg.train.output_dir, optimizer=optimizer, save_to_disk=True)
-        try:
-            start_iter = checkpointer.resume_or_load(cfg.MODEL.WEIGHTS, resume=resume).get("iteration", -1) + 1
-        except Exception as e:
-            print(f"Failed to load checkpoint: {e}")
-            start_iter = 0
+        start_iter = checkpointer.resume_or_load(cfg.MODEL.WEIGHTS, resume=resume).get("iteration", -1) + 1
     else:
         start_iter = 0
 
@@ -335,6 +359,8 @@ def do_train(cfg, model, resume=False):
             max_iter=max_iter,
             max_to_keep=3,
         )
+
+    # setup data preprocessing
 
     img_size = cfg.crops.global_crops_size
     patch_size = cfg.student.patch_size
@@ -370,30 +396,11 @@ def do_train(cfg, model, resume=False):
         )
 
         def decode_and_transform(item):
-            try:
-                # ROBUST LOADING FIX
-                if "image_bytes" not in item:
-                    if "image" in item and isinstance(item["image"], dict) and "bytes" in item["image"]:
-                        item["image_bytes"] = item["image"]["bytes"]
-                    elif "image" in item:
-                         item["image_bytes"] = item["image"]
-                    else:
-                        raise KeyError(f"Missing image data. Available keys: {list(item.keys())}")
-
-                image = Image.open(BytesIO(item["image_bytes"]))
-                image = ImageOps.exif_transpose(image).convert("RGB")
-                transformed = data_transform(image)
-                
-                slide_path = item.get("slide_path", "unknown")
-                x = item.get("x", 0)
-                y = item.get("y", 0)
-                level = item.get("level", 0)
-                
-                slide_meta = (slide_path, x, y, level)
-                return (transformed, None), slide_meta
-            except Exception as e:
-                print(f"[CRITICAL DATA ERROR] {e}")
-                raise e
+            image = Image.open(BytesIO(item["image_bytes"]))
+            image = ImageOps.exif_transpose(image).convert("RGB")
+            transformed = data_transform(image)
+            slide_meta = (item["slide_path"], item["x"], item["y"], item["level"])
+            return (transformed, None), slide_meta
 
         class _TransformedStreamingDataset(torch.utils.data.IterableDataset):
             def __init__(self, dataset_builder, transform, samples_per_epoch=None, reshuffle_every=0):
@@ -419,10 +426,15 @@ def do_train(cfg, model, resume=False):
             def __iter__(self):
                 while True:
                     self._init_or_reshuffle()
+
+                    # Per-RANK quota
                     rank_quota = self._samples_per_epoch or (1 << 62)
+
                     worker_info = torch.utils.data.get_worker_info()
                     num_workers = worker_info.num_workers if worker_info is not None else 1
                     worker_id = worker_info.id if worker_info is not None else 0
+
+                    # Split quota across workers (nearly even split)
                     base = rank_quota // num_workers
                     remainder = rank_quota % num_workers
                     local_quota = base + (1 if worker_id < remainder else 0)
@@ -432,12 +444,15 @@ def do_train(cfg, model, resume=False):
                         try:
                             sample = next(self._src_iter)
                         except StopIteration:
+                            # Refill the iterator; only reshuffle on epoch boundaries
                             self._init_or_reshuffle(force=True)
                             continue
                         yield self._transform(sample)
                         produced += 1
+
                     self._epoch_seen += 1
 
+        # Define explicit per-epoch sample budget per rank to keep ranks in lock-step
         samples_per_epoch = cfg.train.batch_size_per_gpu * cfg.train.OFFICIAL_EPOCH_LENGTH
         dataset = _TransformedStreamingDataset(
             dataset_builder,
@@ -463,7 +478,7 @@ def do_train(cfg, model, resume=False):
     else:
         from dinov2.data import SamplerType, make_data_loader, make_dataset
         dataset = make_dataset(
-            dataset_str=cfg.train.dataset_path,
+            dataset_str="pathology:root=/data/TCGA/",
             transform=data_transform,
             target_transform=lambda _: (),
         )
@@ -475,18 +490,27 @@ def do_train(cfg, model, resume=False):
             shuffle=True,
             seed=0,
             sampler_type=sampler_type,
-            sampler_advance=0,
+            sampler_advance=0,  # TODO(qas): fix this -- start_iter * cfg.train.batch_size_per_gpu,
             drop_last=True,
             collate_fn=collate_fn,
         )
 
+    # training loop
+
     iteration = start_iter
+
     logger.info("Starting training from iteration {}".format(start_iter))
     metrics_file = os.path.join(cfg.train.output_dir, "training_metrics.json")
     metric_logger = MetricLogger(delimiter="  ", output_file=metrics_file)
     header = "Training"
 
-    for data in metric_logger.log_every(data_loader, 10, header, eta_target_iter + 1, start_iter):
+    for data in metric_logger.log_every(
+        data_loader,
+        10,
+        header,
+        eta_target_iter + 1,
+        start_iter,
+    ):
         if iteration >= early_stop_iter:
             logger.info("Early stopping at iteration {}".format(iteration))
             if cfg.evaluation.eval_period_iterations >= 0:
@@ -564,7 +588,11 @@ def do_train(cfg, model, resume=False):
                     v.clip_grad_norm_(clip_grad_val)
             optimizer.step()
 
+        # perform teacher EMA update
+
         model.update_teacher(mom)
+
+        # logging
 
         if distributed.get_global_size() > 1:
             for v in loss_dict.values():
@@ -574,9 +602,12 @@ def do_train(cfg, model, resume=False):
         if math.isnan(sum(loss_dict_reduced.values())):
             print(sum(loss_dict_reduced.values()))
             logger.info("NaN detected")
+            print(data["indexes"])
+            
             for name, param in model.named_parameters():
                 if torch.isnan(param.data).any():
                     print(f"NaNs found in parameter: {name}")
+
             raise AssertionError
         losses_reduced = sum(loss for loss in loss_dict_reduced.values())
 
@@ -599,8 +630,10 @@ def do_train(cfg, model, resume=False):
             }
             wandb.log({**scalar_logs, **loss_dict_reduced}, step=iteration)
     
+        # Synchronize the GPU to ensure all operations are complete before measuring
         torch.cuda.synchronize()
         
+        #Save instantly
         if cfg.evaluation.eval_period_iterations >= 0 and (iteration) % cfg.evaluation.eval_period_iterations == 0:
             do_test(cfg, model, f"training_{iteration}")
             torch.cuda.synchronize()
@@ -611,17 +644,13 @@ def do_train(cfg, model, resume=False):
     metric_logger.synchronize_between_processes()
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
+
 def main(args):
     cfg = setup(args)
     print(cfg)
-    
-    if args.debug and distributed.is_main_process():
-        logger.info("DEBUG MODE ENABLED: Recording Memory History")
-        torch.cuda.memory._record_memory_history()
-        torch._C._cuda_attach_out_of_memory_observer(oom_observer)
-
     model = SimSSLMetaArch(cfg).to(torch.device("cuda"))
     if cfg.train.use_pretrained:
+
         if cfg.student.arch == "vit_giant2":
             print("loading pretrained DinoV2-giant") 
             model_pretrained = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitg14_reg')
@@ -635,6 +664,13 @@ def main(args):
         model.student.backbone.register_tokens = model_pretrained.register_tokens
         model.student.backbone.mask_token = model_pretrained.mask_token
 
+        print(model.state_dict().keys())
+        print(model_pretrained.state_dict().keys())
+        print(model_pretrained.pos_embed.shape) #1, 1360, 384. We lose pos embed because it was 518
+        print(model.student.backbone.pos_embed.shape) #1, 257, 384
+
+        # We need to make sure we grab *all* of the keys.
+        # For each block, copy weights over.
         layers = []
         for layer in model_pretrained.blocks:
             layers.append(layer)
@@ -684,6 +720,7 @@ def main(args):
         return do_test(cfg, model, f"manual_{iteration}")
 
     do_train(cfg, model, resume=not args.no_resume)
+
 
 if __name__ == "__main__":
     args = get_args_parser(add_help=True).parse_args()
