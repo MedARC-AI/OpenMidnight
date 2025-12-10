@@ -34,15 +34,12 @@ train:
   batch_size_per_gpu: 16  # num regions per GPU (each region = 256 patches)
   num_workers: 4
   epochs: 100
-  OFFICIAL_EPOCH_LENGTH: 1000
   output_dir: /home/paul/OpenMidnight/outputs/context_adaptation
 
 optim:
-  base_lr: 1.0e-4
+  base_lr: 3.0e-5
   min_lr: 1.0e-6
   weight_decay: 0.05
-  weight_decay_end: 0.05
-  warmup_epochs: 5
   adamw_beta1: 0.9
   adamw_beta2: 0.999
   clip_grad: 3.0

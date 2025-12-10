@@ -420,26 +420,33 @@ class ContextAdaptationModel(nn.Module):
         Args:
             patches: [B, 256, 3, 224, 224]
             mae_mask: [B, 256] - bool, True = masked for reconstruction
+
+        Two-pass design to align training with downstream inference:
+        1. Unmasked pass: context-ViT sees all patches → contrastive embeddings
+           (matches downstream where we always have full context)
+        2. Masked pass (if needed): context-ViT masks tokens → MAE reconstruction
+           (prevents information leakage, forces learning from context)
         """
         # Get patch embeddings from frozen OpenMidnight
         patch_embeddings = self.extract_patch_embeddings(patches)
 
-        # Process through context ViT
-        context_out = self.context_vit(patch_embeddings, mask=mae_mask)
+        # Pass 1: Unmasked forward for contrastive (matches downstream inference)
+        context_out_full = self.context_vit(patch_embeddings, mask=None)
 
-        # Get contrastive embeddings
-        contrastive_embeddings = self.contrastive_proj(context_out["patch_tokens"])
+        # Contrastive embeddings from context-enriched tokens (post self-attention)
+        contrastive_embeddings = self.contrastive_proj(context_out_full["patch_tokens"])
         contrastive_embeddings = F.normalize(contrastive_embeddings, dim=-1)
 
-        # MAE reconstruction if mask provided
+        # Pass 2: Masked forward for MAE (only when needed)
         mae_pred = None
         if mae_mask is not None and mae_mask.any():
-            mae_pred = self.mae_decoder(context_out["patch_tokens"], mae_mask)
+            context_out_masked = self.context_vit(patch_embeddings, mask=mae_mask)
+            mae_pred = self.mae_decoder(context_out_masked["patch_tokens"], mae_mask)
 
         return {
             "patch_embeddings": patch_embeddings,
-            "context_cls": context_out["cls_token"],
-            "context_patches": context_out["patch_tokens"],
+            "context_cls": context_out_full["cls_token"],
+            "context_patches": context_out_full["patch_tokens"],
             "contrastive_embeddings": contrastive_embeddings,
             "mae_pred": mae_pred,
         }
@@ -621,13 +628,10 @@ def save_debug_images(batch, model_out, mae_mask, cfg, iteration, rank=0):
 
     B = patches.shape[0]
 
-    saved = 0
     for b in range(B):
         mask_b = mae_mask_cpu[b]  # [256]
         if not mask_b.any():
             continue  # Only save samples that were actually masked
-        if saved >= 2:
-            break
 
         # 1. Save original region
         region_img = denormalize(region[b])
@@ -668,8 +672,16 @@ def save_debug_images(batch, model_out, mae_mask, cfg, iteration, rank=0):
                     recon_vis[i] = patch_pixels[i].clamp(0, 1)
 
             grid_recon = make_grid(recon_vis, nrow=16, padding=2)
-            save_image(grid_recon, debug_dir / f"iter{iteration}_sample{b}_reconstruction.png")
-        saved += 1
+            recon_path = debug_dir / f"iter{iteration}_sample{b}_reconstruction.png"
+            save_image(grid_recon, recon_path)
+
+            # Log reconstruction grid to wandb for visibility
+            if wandb.run is not None:
+                wandb.log(
+                    {"images/reconstruction": wandb.Image(str(recon_path))},
+                    step=iteration,
+                )
+        break  # Save only the first valid sample
 
     logger.info(f"Saved debug images to {debug_dir}")
 
@@ -750,18 +762,13 @@ def train(cfg):
         betas=(cfg.optim.adamw_beta1, cfg.optim.adamw_beta2),
     )
 
-    # Learning rate scheduler
+    # Learning rate scheduler: cosine decay without warmup
     total_steps = cfg.train.epochs * steps_per_epoch
-    warmup_steps = cfg.optim.warmup_epochs * steps_per_epoch
-
-    def lr_lambda(step):
-        if step < warmup_steps:
-            return step / warmup_steps
-        else:
-            progress = (step - warmup_steps) / (total_steps - warmup_steps)
-            return 0.5 * (1 + math.cos(math.pi * progress))
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=total_steps,
+        eta_min=cfg.optim.min_lr,
+    )
 
     # Training loop
     iteration = 0
