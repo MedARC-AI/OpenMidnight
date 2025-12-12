@@ -14,9 +14,14 @@ from io import BytesIO
 from pathlib import Path
 import gc
 import contextlib
+import pickle
+import numpy as np
+import traceback
 
 from fvcore.common.checkpoint import PeriodicCheckpointer
 import torch
+import timm
+import timm.optim
 
 from dinov2.data import collate_data_and_cast, DataAugmentationDINO, MaskingGenerator
 import dinov2.distributed as distributed
@@ -25,7 +30,7 @@ from dinov2.logging import MetricLogger
 from dinov2.utils.config import setup
 from dinov2.utils.utils import CosineScheduler
 
-from dinov2.train.ssl_meta_arch import SSLMetaArch
+from dinov2.train.ssl_meta_arch import SimSSLMetaArch
 from datasets import IterableDatasetDict, load_dataset, DownloadConfig
 from PIL import Image, ImageOps
 import torch.utils.data
@@ -46,6 +51,11 @@ from torch.distributed.fsdp import (
 torch.backends.cuda.matmul.allow_tf32 = True  # PyTorch 1.12 sets this to False by default
 logger = logging.getLogger("dinov2")
 import wandb
+
+def oom_observer(device, alloc, device_alloc, device_free):
+    print('saving allocated state during OOM')
+    snapshot = torch.cuda.memory._snapshot()
+    pickle.dump(snapshot, open('oom_snapshot.pickle', 'wb'))
 
 def _build_streaming_dataset(
     dataset_path: str,
@@ -114,7 +124,13 @@ For python-based LazyConfig, use "path.key=value".
 
 
 def build_optimizer(cfg, params_groups):
-    return torch.optim.AdamW(params_groups, betas=(cfg.optim.adamw_beta1, cfg.optim.adamw_beta2))
+    # SimDINO Logic: Use timm.optim if specified
+    if hasattr(cfg.optim, 'opt') and cfg.optim.opt:
+        opt_lower = cfg.optim.opt.lower()
+        kwargs = getattr(cfg.optim, 'kwargs', {})
+        return timm.optim.create_optimizer_v2(params_groups, opt=opt_lower, **kwargs)
+    else:
+        return torch.optim.AdamW(params_groups, betas=(cfg.optim.adamw_beta1, cfg.optim.adamw_beta2))
 
 
 def build_schedulers(cfg):
@@ -143,16 +159,67 @@ def build_schedulers(cfg):
         warmup_iters=cfg.teacher["warmup_teacher_temp_epochs"] * OFFICIAL_EPOCH_LENGTH,
         start_warmup_value=cfg.teacher["warmup_teacher_temp"],
     )
+    
+    # MCR Coefficient
+    # Note: Using getattr to avoid crashes if keys missing in older configs
+    mcr_coeff_val = getattr(cfg.dino.mcr, "coeff", 1.0) if hasattr(cfg.dino, "mcr") else 1.0
+    mcr_coeff_end = getattr(cfg.dino.mcr, "coeff_end", -1) if hasattr(cfg.dino, "mcr") else -1
+    mcr_expa_end_epoch = getattr(cfg.dino.mcr, "expa_end_epoch", 0) if hasattr(cfg.dino, "mcr") else 0
+    
+    coeff = dict(
+        base_value=mcr_coeff_val,
+        final_value=mcr_coeff_end if mcr_coeff_end > 0 else mcr_coeff_val,
+        total_iters=(mcr_expa_end_epoch if mcr_expa_end_epoch > 0 else cfg.optim["epochs"]) * OFFICIAL_EPOCH_LENGTH if mcr_coeff_end > 0 else 0,
+        warmup_iters=0,
+        start_warmup_value=0,
+    )
+
+    # iBOT Weight
+    ibot_loss_weight = getattr(cfg.ibot, "loss_weight", 0)
+    ibot_loss_weight_end = getattr(cfg.ibot, "loss_weight_end", -1)
+    ibot_warmup_epochs = getattr(cfg.ibot, "loss_weight_warmup_epochs", 0)
+    ibot_freeze_epochs = getattr(cfg.ibot, "loss_weight_freeze_epochs", 0)
+
+    ibot_weight = dict(
+        base_value=ibot_loss_weight,
+        final_value=ibot_loss_weight_end if ibot_loss_weight_end > 0 else ibot_loss_weight,
+        total_iters=cfg.optim["epochs"] * OFFICIAL_EPOCH_LENGTH if ibot_loss_weight_end > 0 else 0,
+        warmup_iters=ibot_warmup_epochs * OFFICIAL_EPOCH_LENGTH,
+        start_warmup_value=0,
+        freeze_iters=ibot_freeze_epochs * OFFICIAL_EPOCH_LENGTH,
+    )
+
+    # Clip Grad
+    clip_grad_val = getattr(cfg.optim, "clip_grad", 0)
+    clip_grad_end = getattr(cfg.optim, "clip_grad_end", -1)
+    
+    clip_grad = dict(
+        base_value=clip_grad_val,
+        final_value=clip_grad_end if clip_grad_end > 0 else clip_grad_val,
+        total_iters=cfg.optim["epochs"] * OFFICIAL_EPOCH_LENGTH if clip_grad_end > 0 else 0,
+    )
+
+    # MCR Epsilon
+    mcr_eps_val = getattr(cfg.dino.mcr, "eps", 0.05) if hasattr(cfg.dino, "mcr") else 0.05
+    mcr_eps_end = getattr(cfg.dino.mcr, "eps_end", -1) if hasattr(cfg.dino, "mcr") else -1
+    
+    eps_schedule = dict(
+        base_value=mcr_eps_val,
+        final_value=mcr_eps_end if mcr_eps_end > 0 else mcr_eps_val,
+        total_iters=(mcr_expa_end_epoch if mcr_expa_end_epoch > 0 else cfg.optim["epochs"]) * OFFICIAL_EPOCH_LENGTH if mcr_eps_end > 0 else 0,
+        warmup_iters=0,
+        start_warmup_value=0,
+    )
 
     lr_schedule = CosineScheduler(**lr)
     wd_schedule = CosineScheduler(**wd)
     momentum_schedule = CosineScheduler(**momentum)
     teacher_temp_schedule = CosineScheduler(**teacher_temp)
     last_layer_lr_schedule = CosineScheduler(**lr)
-
-    last_layer_lr_schedule.schedule[
-        : cfg.optim["freeze_last_layer_epochs"] * OFFICIAL_EPOCH_LENGTH
-    ] = 0  # mimicking the original schedules
+    mcr_coeff_schedule = CosineScheduler(**coeff)
+    mcr_eps_schedule = CosineScheduler(**eps_schedule)
+    ibot_weight_schedule = CosineScheduler(**ibot_weight)
+    clip_grad_schedule = CosineScheduler(**clip_grad)
 
     logger.info("Schedulers ready.")
 
@@ -162,6 +229,10 @@ def build_schedulers(cfg):
         momentum_schedule,
         teacher_temp_schedule,
         last_layer_lr_schedule,
+        mcr_coeff_schedule,
+        mcr_eps_schedule,
+        ibot_weight_schedule,
+        clip_grad_schedule,
     )
 
 
@@ -226,12 +297,18 @@ def do_train(cfg, model, resume=False):
     # setup optimizer
 
     optimizer = build_optimizer(cfg, model.get_params_groups())
+    
+    # Unpack all 9 schedulers from SimDINO logic
     (
         lr_schedule,
         wd_schedule,
         momentum_schedule,
         teacher_temp_schedule,
         last_layer_lr_schedule,
+        mcr_coeff_schedule,
+        mcr_eps_schedule,
+        ibot_weight_schedule,
+        clip_grad_schedule,
     ) = build_schedulers(cfg)
     
     from omegaconf import OmegaConf
@@ -270,6 +347,10 @@ def do_train(cfg, model, resume=False):
     max_iter = cfg.optim.epochs * OFFICIAL_EPOCH_LENGTH
     early_stop_iter = cfg.optim.early_stop * OFFICIAL_EPOCH_LENGTH
     eta_target_iter = min(max_iter, early_stop_iter)
+    
+    # For freezing logic
+    freeze_backbone = False
+    freeze_backbone_iter = getattr(cfg.student, "freeze_backbone_epochs", 0) * OFFICIAL_EPOCH_LENGTH
 
     if not single_gpu_run:
         periodic_checkpointer = PeriodicCheckpointer(
@@ -305,8 +386,6 @@ def do_train(cfg, model, resume=False):
         mask_generator=mask_generator,
         dtype=inputs_dtype,
     )
-
-    # setup data loader
 
     if cfg.train.streaming_from_hf:
         dataset_builder = partial(
@@ -446,40 +525,67 @@ def do_train(cfg, model, resume=False):
             return
         
         nan_mask = torch.isnan(data["collated_global_crops"])
-        nan_mask2 = torch.isnan(data["collated_local_crops"])
         if nan_mask.any():
             print("found nan in input data")
-            print(data[indexes])
-        
-
-        # apply schedules
 
         lr = lr_schedule[iteration]
         wd = wd_schedule[iteration]
         mom = momentum_schedule[iteration]
         teacher_temp = teacher_temp_schedule[iteration]
         last_layer_lr = last_layer_lr_schedule[iteration]
+        
         apply_optim_scheduler(optimizer, lr, wd, last_layer_lr)
 
-        # compute losses
+        # SimDINO MCR Schedule Updates
+        if getattr(cfg.dino, "use_mcr", False):
+            mcr_coeff = mcr_coeff_schedule[iteration]
+            model.dino_loss.coeff = mcr_coeff
+            mcr_eps = mcr_eps_schedule[iteration]
+            model.dino_loss.eps = mcr_eps
+        
+        # Update iBOT weight if scheduled
+        if getattr(cfg.ibot, "loss_weight", 0) > 0:
+            model.ibot_loss_weight = float(ibot_weight_schedule[iteration])
+
+        # Dynamic Patch Sizing
+        patch_size_seq = getattr(cfg.student, "patch_size_seq", None)
+        if patch_size_seq:
+            new_patch_size = np.random.choice(patch_size_seq)
+            model.student.backbone.patch_embed.update_patch_size(new_patch_size)
+            model.teacher.backbone.patch_embed.update_patch_size(new_patch_size)
 
         optimizer.zero_grad(set_to_none=True)
 
+        # Backbone Freezing Logic (SimDINO)
+        if freeze_backbone_iter > 0:
+            if iteration < freeze_backbone_iter:
+                if not freeze_backbone:
+                    for param in model.student.backbone.parameters():
+                            param.requires_grad = False
+                    freeze_backbone = True
+                    logger.info(f"Freeze backbone at iter {iteration}")
+            else:
+                if freeze_backbone:
+                    for param in model.student.backbone.parameters():
+                        param.requires_grad = True
+                    logger.info(f"Unfreeze backbone at iter {iteration}")
+                    freeze_backbone = False
+
         loss_dict = model.forward_backward(data, teacher_temp=teacher_temp)
 
-        # clip gradients
-
+        # Gradient Clipping (SimDINO Schedule)
+        clip_grad_val = clip_grad_schedule[iteration]
         if fp16_scaler is not None:
-            if cfg.optim.clip_grad:
+            if clip_grad_val > 0:
                 fp16_scaler.unscale_(optimizer)
                 for v in model.student.values():
-                    v.clip_grad_norm_(cfg.optim.clip_grad)
+                    v.clip_grad_norm_(clip_grad_val)
             fp16_scaler.step(optimizer)
             fp16_scaler.update()
         else:
-            if cfg.optim.clip_grad:
+            if clip_grad_val > 0:
                 for v in model.student.values():
-                    v.clip_grad_norm_(cfg.optim.clip_grad)
+                    v.clip_grad_norm_(clip_grad_val)
             optimizer.step()
 
         # perform teacher EMA update
@@ -510,6 +616,9 @@ def do_train(cfg, model, resume=False):
         metric_logger.update(mom=mom)
         metric_logger.update(last_layer_lr=last_layer_lr)
         metric_logger.update(current_batch_size=current_batch_size)
+        if "total_loss" in loss_dict_reduced:
+            loss_dict_reduced.pop("total_loss")
+
         metric_logger.update(total_loss=losses_reduced, **loss_dict_reduced)
         
         if distributed.is_main_process():
@@ -539,8 +648,7 @@ def do_train(cfg, model, resume=False):
 def main(args):
     cfg = setup(args)
     print(cfg)
-    model = SSLMetaArch(cfg).to(torch.device("cuda"))
-    #Load model here from pretrained.
+    model = SimSSLMetaArch(cfg).to(torch.device("cuda"))
     if cfg.train.use_pretrained:
 
         if cfg.student.arch == "vit_giant2":
@@ -589,9 +697,12 @@ def main(args):
                         sublayer.mlp.w12.bias = current.mlp.w12.bias
                         sublayer.mlp.w3.weight = current.mlp.w3.weight
                         sublayer.mlp.w3.bias = current.mlp.w3.bias
-                    sublayer.ls1.gamma = current.ls1.gamma
-                    sublayer.ls2.gamma = current.ls2.gamma
-
+                    
+                    # Robust loading for SimDINO Block compatibility
+                    if hasattr(sublayer, 'ls1') and hasattr(current, 'ls1') and hasattr(sublayer.ls1, 'gamma'):
+                        sublayer.ls1.gamma = current.ls1.gamma
+                    if hasattr(sublayer, 'ls2') and hasattr(current, 'ls2') and hasattr(sublayer.ls2, 'gamma'):
+                        sublayer.ls2.gamma = current.ls2.gamma
 
         model.student.backbone.norm.weight = model_pretrained.norm.weight
         model.student.backbone.norm.bias = model_pretrained.norm.bias 
