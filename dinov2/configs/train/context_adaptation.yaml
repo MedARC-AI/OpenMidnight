@@ -1,6 +1,3 @@
-# Context Adaptation Training Config
-# Trains a context-ViT to process 3584x3584 regions using OpenMidnight patch embeddings
-
 data:
   tcga_root: /data/TCGA
   sample_list: /data/TCGA/sample_dataset_30.txt
@@ -15,11 +12,18 @@ patch_vit:
   patch_size: 14  # ViT internal patch size
   embed_dim: 1536
   num_register_tokens: 4
-  freeze: true  # Keep OpenMidnight frozen
+  # Checkpoint was trained with chunked blocks + SwiGLU FFN + LayerScale
+  block_chunks: 4
+  ffn_layer: swiglu  # or swiglufused if you have fused kernels
+  init_values: 1.0
+  freeze: true  # if true *all* of OpenMidnight will fine-tune, if you want to fine-tune just the last few transformer blocks then set to false and set unfreeze_last_blocks>0 
+  # Optional partial finetuning for finer-grained adaptation:
+  # unfreeze_last_blocks > 0 will unfreeze that many final transformer blocks and the final norm. Set to 0 to keep the default frozen behavior. lr_scale multiplies the base_lr for these params.
+  unfreeze_last_blocks: 1
+  lr_scale: 0.1
 
 context_vit:
-  # Smaller ViT for processing the 256 patch embeddings
-  embed_dim: 768
+  embed_dim: 1536 # same embed_dim as original vitgiant2
   depth: 12
   num_heads: 12
   mlp_ratio: 4.0
@@ -27,13 +31,13 @@ context_vit:
 
 mae_decoder:
   embed_dim: 512
-  depth: 4
-  num_heads: 8
+  depth: 2
+  num_heads: 4
 
 train:
-  batch_size_per_gpu: 16  # num regions per GPU (each region = 256 patches)
+  batch_size_per_gpu: 1 # num regions per GPU (each region = 256 patches)
   num_workers: 4
-  epochs: 100
+  max_iters: 10000 #0  # stop after this many iterations
   output_dir: /home/paul/OpenMidnight/outputs/context_adaptation
 
 optim:
@@ -56,7 +60,7 @@ loss:
   mae_num_masked_samples: 0.25  # fraction of regions to perform masking on mae_mask_ratio percent of its patches; forces min=2
 
 evaluation:
-  save_period_epochs: 5
+  save_period_iters: 250
   debug_save_images: true  # save debug images initially
   debug_save_dir: /home/paul/OpenMidnight/outputs/context_adaptation/debug_images
 

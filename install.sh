@@ -37,27 +37,5 @@ fi
 uv venv
 uv pip install -e . --torch-backend=auto -p .venv/bin/python
 
-# Loosen transformers' hub pin and runtime check so hub 1.x works
-.venv/bin/python - <<'PY'
-from importlib import import_module
-from pathlib import Path
-
-def patch(module, needle, repl):
-    try:
-        path = Path(import_module(module).__file__)
-    except Exception as exc:
-        print(f"skip {module}: {exc}")
-        return
-    text = path.read_text()
-    if needle in text:
-        path.write_text(text.replace(needle, repl))
-        print(f"patched {path}")
-    else:
-        print(f"{module}: pattern not found")
-
-patch("transformers.dependency_versions_table", 'huggingface-hub>=0.34.0,<1.0', 'huggingface-hub>=0.34.0')
-patch("transformers.dependency_versions_check", '    "huggingface-hub",\n', "")
-PY
-
 echo "Environment ready. Activate it with 'source .venv/bin/activate' when needed."
 echo "By default wandb logging is enabled, remember to run 'wandb init' before training."

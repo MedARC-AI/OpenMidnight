@@ -46,7 +46,7 @@ class RegionDataset(Dataset):
         self.patch_size = cfg.data.patch_size
         self.patches_per_side = cfg.data.patches_per_side
 
-        # Load sample list
+        # Load svs sample list
         self.samples = []
         with open(cfg.data.sample_list, "r") as f:
             for line in f.readlines():
@@ -58,8 +58,6 @@ class RegionDataset(Dataset):
                     y = int(parts[2])
                     level = int(parts[3])
                     self.samples.append((path, x, y, level))
-
-        logger.info(f"Loaded {len(self.samples)} patch samples, will sample regions around them")
 
         # ImageNet normalization
         self.normalize = transforms.Normalize(
@@ -90,8 +88,8 @@ class RegionDataset(Dataset):
         downsample = slide.level_downsamples[level]
         region_size_level0 = int(round(self.region_size * downsample))
 
+        # Skip samples that cannot fit the desired region size
         if region_size_level0 > level0_w or region_size_level0 > level0_h:
-            # Skip samples that cannot fit the desired region size
             return self.__getitem__((idx + 1) % len(self))
 
         max_x = max(level0_w - region_size_level0, 0)
@@ -99,8 +97,6 @@ class RegionDataset(Dataset):
         orig_x, orig_y = region_x, region_y
         region_x = min(region_x, max_x)
         region_y = min(region_y, max_y)
-
-        # Clamping applied silently; no logging
 
         # Read the full region
         region = slide.read_region(
@@ -339,9 +335,32 @@ class ContextAdaptationModel(nn.Module):
 
         # Load frozen OpenMidnight
         self.patch_vit = self._load_patch_vit(cfg)
+        self.train_patch_vit = False
+        freeze_all = bool(getattr(cfg.patch_vit, "freeze", True))
+
+        # Default: freeze everything
         for param in self.patch_vit.parameters():
             param.requires_grad = False
-        self.patch_vit.eval()
+
+        if not freeze_all:
+            for param in self.patch_vit.parameters():
+                param.requires_grad = True
+            self.train_patch_vit = True
+        else:
+            # Optionally unfreeze a small tail of blocks for fine-grained adaptation
+            unfreeze_last = int(getattr(cfg.patch_vit, "unfreeze_last_blocks", 0))
+            if unfreeze_last > 0:
+                blocks = list(self.patch_vit.blocks)[-unfreeze_last:]
+                for blk in blocks:
+                    for p in blk.parameters():
+                        p.requires_grad = True
+                if hasattr(self.patch_vit, "norm"):
+                    for p in self.patch_vit.norm.parameters():
+                        p.requires_grad = True
+                self.train_patch_vit = True
+            else:
+                # Keep fully frozen for default behavior
+                self.patch_vit.eval()
 
         # Context ViT
         self.context_vit = ContextViT(cfg)
@@ -365,7 +384,10 @@ class ContextAdaptationModel(nn.Module):
             patch_size=cfg.patch_vit.patch_size,
             num_register_tokens=cfg.patch_vit.num_register_tokens,
             img_size=cfg.data.patch_size,  # 224
-            block_chunks=0,  # No chunking for inference
+            # Match OpenMidnight checkpoint architecture (chunking + SwiGLU + LayerScale)
+            block_chunks=int(getattr(cfg.patch_vit, "block_chunks", 4)),
+            ffn_layer=getattr(cfg.patch_vit, "ffn_layer", "swiglu"),
+            init_values=float(getattr(cfg.patch_vit, "init_values", 1.0)),
         )
 
         # Load checkpoint
@@ -386,10 +408,9 @@ class ContextAdaptationModel(nn.Module):
 
         return patch_vit
 
-    @torch.no_grad()
     def extract_patch_embeddings(self, patches):
         """
-        Extract embeddings from all patches using frozen OpenMidnight.
+        Extract embeddings from all patches using OpenMidnight.
         Args:
             patches: [B, 256, 3, 224, 224]
         Returns:
@@ -404,11 +425,12 @@ class ContextAdaptationModel(nn.Module):
         batch_size = 64
         embeddings_list = []
 
-        for i in range(0, B * N, batch_size):
-            batch = patches_flat[i:i+batch_size]
-            out = self.patch_vit(batch, is_training=True)
-            # Use CLS token as patch embedding
-            embeddings_list.append(out["x_norm_clstoken"])
+        with torch.set_grad_enabled(self.train_patch_vit):
+            for i in range(0, B * N, batch_size):
+                batch = patches_flat[i:i+batch_size]
+                out = self.patch_vit(batch, is_training=True)
+                # Use CLS token as patch embedding
+                embeddings_list.append(out["x_norm_clstoken"])
 
         embeddings = torch.cat(embeddings_list, dim=0)  # [B*N, 1536]
         embeddings = embeddings.view(B, N, -1)  # [B, 256, 1536]
@@ -743,41 +765,62 @@ def train(cfg):
     # Create model
     model = ContextAdaptationModel(cfg).to(device)
 
-    # Wrap trainable parts in DDP (patch_vit is frozen, no need to wrap)
+    # Wrap trainable parts in DDP
+    if model.train_patch_vit:
+        model.patch_vit = DDP(model.patch_vit, device_ids=[local_rank])
     model.context_vit = DDP(model.context_vit, device_ids=[local_rank])
     model.mae_decoder = DDP(model.mae_decoder, device_ids=[local_rank])
     model.contrastive_proj = DDP(model.contrastive_proj, device_ids=[local_rank])
 
-    # Optimizer - only trainable parameters
-    trainable_params = (
-        list(model.context_vit.parameters()) +
-        list(model.mae_decoder.parameters()) +
-        list(model.contrastive_proj.parameters())
-    )
+    # Optimizer - parameter groups (optionally include a small tail of patch_vit)
+    base_lr = cfg.optim.base_lr
+    param_groups = [
+        {"params": list(model.context_vit.parameters()), "lr": base_lr},
+        {"params": list(model.mae_decoder.parameters()), "lr": base_lr},
+        {"params": list(model.contrastive_proj.parameters()), "lr": base_lr},
+    ]
+
+    if model.train_patch_vit:
+        patch_lr_scale = float(getattr(cfg.patch_vit, "lr_scale", 1.0))
+        patch_params = [p for p in model.patch_vit.parameters() if p.requires_grad]
+        param_groups.append({"params": patch_params, "lr": base_lr * patch_lr_scale})
+
+    all_trainable_params = []
+    for group in param_groups:
+        all_trainable_params.extend(group["params"])
 
     optimizer = torch.optim.AdamW(
-        trainable_params,
-        lr=cfg.optim.base_lr,
+        param_groups,
+        lr=base_lr,
         weight_decay=cfg.optim.weight_decay,
         betas=(cfg.optim.adamw_beta1, cfg.optim.adamw_beta2),
     )
 
     # Learning rate scheduler: cosine decay without warmup
-    total_steps = cfg.train.epochs * steps_per_epoch
+    max_iters_cfg = int(getattr(cfg.train, "max_iters", 0))
+    epochs_cfg = int(getattr(cfg.train, "epochs", 0))
+    total_steps = max_iters_cfg if max_iters_cfg > 0 else epochs_cfg * steps_per_epoch
+    if total_steps <= 0:
+        raise ValueError("total_steps must be > 0 (check max_iters / epochs config).")
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=total_steps,
         eta_min=cfg.optim.min_lr,
     )
+    save_period_iters = int(getattr(cfg.evaluation, "save_period_iters", 0))
 
     # Training loop
     iteration = 0
+    epoch = 0
 
-    for epoch in range(cfg.train.epochs):
+    model.train()
+    if model.train_patch_vit:
+        model.patch_vit.train()
+    else:
+        model.patch_vit.eval()
+
+    while iteration < total_steps:
         sampler.set_epoch(epoch)
-        model.train()
-        model.patch_vit.eval()  # Keep frozen model in eval mode
-
         for batch_idx, batch in enumerate(dataloader):
             patches = batch["patches"].to(device)  # [B, 256, 3, 224, 224]
             positions = batch["positions"].to(device)  # [B, 256, 2]
@@ -787,7 +830,7 @@ def train(cfg):
             # Create MAE mask
             mae_mask = torch.zeros(B, N, dtype=torch.bool, device=device)
 
-            # For a fraction of samples, apply high masking ratio
+            # For a fraction of regions/samples, apply high masking ratio
             frac = float(cfg.loss.mae_num_masked_samples)
             num_masked_samples = math.ceil(frac * B)
             num_masked_samples = max(2, min(num_masked_samples, B)) if B > 1 else 1
@@ -851,10 +894,10 @@ def train(cfg):
 
             grad_norm = None
             if cfg.optim.clip_grad > 0:
-                grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, cfg.optim.clip_grad)
+                grad_norm = torch.nn.utils.clip_grad_norm_(all_trainable_params, cfg.optim.clip_grad)
             else:
                 # Compute grad norm without clipping for logging
-                norms = [p.grad.data.norm(2) for p in trainable_params if p.grad is not None]
+                norms = [p.grad.data.norm(2) for p in all_trainable_params if p.grad is not None]
                 grad_norm = torch.norm(torch.stack(norms), 2) if norms else torch.tensor(0.0, device=device)
 
             optimizer.step()
@@ -888,28 +931,33 @@ def train(cfg):
 
             iteration += 1
 
+            # Iteration-based checkpointing (preferred when max_iters is set)
+            if (
+                is_main
+                and save_period_iters > 0
+                and iteration > 0
+                and iteration % save_period_iters == 0
+            ):
+                ckpt_path = Path(cfg.train.output_dir) / f"checkpoint_iter{iteration}.pth"
+                ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+
+                torch.save({
+                    "epoch": epoch,
+                    "iteration": iteration,
+                    **({"patch_vit": model.patch_vit.module.state_dict()} if model.train_patch_vit else {}),
+                    "context_vit": model.context_vit.module.state_dict(),
+                    "mae_decoder": model.mae_decoder.module.state_dict(),
+                    "contrastive_proj": model.contrastive_proj.module.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                }, ckpt_path)
+
+                logger.info(f"Saved checkpoint to {ckpt_path}")
+
             if iteration >= total_steps:
                 break
 
-        # Save checkpoint
-        if is_main and (epoch + 1) % cfg.evaluation.save_period_epochs == 0:
-            ckpt_path = Path(cfg.train.output_dir) / f"checkpoint_epoch{epoch+1}.pth"
-            ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-
-            torch.save({
-                "epoch": epoch,
-                "iteration": iteration,
-                "context_vit": model.context_vit.module.state_dict(),
-                "mae_decoder": model.mae_decoder.module.state_dict(),
-                "contrastive_proj": model.contrastive_proj.module.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-            }, ckpt_path)
-
-            logger.info(f"Saved checkpoint to {ckpt_path}")
-
-        if iteration >= total_steps:
-            break
+        epoch += 1
 
     # Final save
     if is_main:
@@ -917,6 +965,7 @@ def train(cfg):
         torch.save({
             "epoch": epoch,
             "iteration": iteration,
+            **({"patch_vit": model.patch_vit.module.state_dict()} if model.train_patch_vit else {}),
             "context_vit": model.context_vit.module.state_dict(),
             "mae_decoder": model.mae_decoder.module.state_dict(),
             "contrastive_proj": model.contrastive_proj.module.state_dict(),

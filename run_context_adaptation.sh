@@ -40,7 +40,7 @@ echo "GPUs: $NUM_GPUS"
 echo "=========================================="
 
 # Run distributed training with torchrun
-torchrun \
+uv run torchrun \
     --standalone \
     --nproc_per_node=$NUM_GPUS \
     /home/paul/OpenMidnight/dinov2/train/train_context.py \
