@@ -64,14 +64,10 @@ If you are wanting to exactly replicate our checkpoint, note that we did not tra
 ## Training Single GPU (Short Config)
 
 ```bash
-./run_short_1gpu.sh
+./run_ablation.sh
 ```
 
-We are still working on a YAML config tweaked to support an informative, short training run on a single GPU that can be completed in under 24 hours. We hope this can be particularly useful for debugging and ablation experiments.
-
-The current `run_short_1gpu.sh` uses `dinov2/configs/train/vitg14_reg4_short1.yaml`, which is the same as the full reproduction's YAML config but with batch size lowered from 48 to 44, epochs lowered from 200 to 15, warmup_epochs lowered from 10 to 7, no early stopping, and FSDPCheckpointing disabled (so resuming an interrupted run will not work). On a single H100 GPU, this run completes in ~5 hours (will likely run out of memory on older GPUs).
-
-We also provide another YAML config, `dinov2/configs/train/vitg14_reg4_short2.yaml` which is identical but increases the epochs to 55, taking around 20 hours on 1 H100 to train.
+This does finetuning with a YAML config (`dinov2/configs/train/vits14_reg_ablations.yaml`) tweaked to support an informative, short training run on a single GPU that can be completed in under 24 hours. We hope this can be particularly useful for debugging and ablation experiments.
 
 ## Training Single Node, Multi‑GPU (Full Reproduction)
 

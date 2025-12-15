@@ -19,7 +19,7 @@ dependencies = [
     "submitit>=1.5.3",
     "torchmetrics>=1.8.0",
     "wandb>=0.21.0",
-    "huggingface-hub>=1.0.1",
+    "huggingface-hub==1.2.3",
     "torch==2.8.0",
     "torchvision",
     "xformers>=0.0.32.post2",
@@ -31,7 +31,7 @@ dependencies = [
     "jsonargparse[omegaconf]>=4.30.0",
     "tensorboard>=2.16.2",
     "loguru>=0.7.2",
-    "transformers>=5.0.0rc1",
+    "transformers==5.0.0rc1",
     "onnxruntime>=1.15.1",
     "onnx>=1.16.0",
     "toolz>=0.12.1",
@@ -48,11 +48,6 @@ include = ["dinov2*"]
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
-
-[tool.uv]
-override-dependencies = [
-    "huggingface-hub>=1.0.1",
-]
 
 [tool.uv.pip]
 # Use uv's auto detection when installing via `uv pip`

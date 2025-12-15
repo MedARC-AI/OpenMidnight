@@ -7,6 +7,10 @@ create_sample_dataset_txt.py:
 
     /path/to/slide.svs <x> <y> <level>
 
+Lines that include MPP metadata from the ablation sampler are also accepted:
+
+    /path/to/slide.svs <x> <y> <level> <mpp_x> <mpp_y>
+
 The script opens every referenced slide once, extracts a 224x224 RGB patch at the
 requested coordinates/level, and writes the samples into per-task Parquet files.
 It supports PNG/JPEG/raw outputs, task chunking, resume markers, and optional
@@ -123,11 +127,13 @@ def parse_specs(spec_file: Path) -> List[PatchSpec]:
             if not line or line.startswith("#"):
                 continue
             parts = line.split()
-            if len(parts) != 4:
+            if len(parts) == 4:
+                slide_path, x, y, level = parts
+            elif len(parts) == 6:
+                slide_path, x, y, level, *_mpp = parts
+            else:
                 raise ValueError(f"Invalid spec line {idx}: {line}")
-            slide_path = parts[0]
-            x, y, level = map(int, parts[1:4])
-            specs.append(PatchSpec(slide_path, x, y, level))
+            specs.append(PatchSpec(slide_path, int(x), int(y), int(level)))
     if not specs:
         raise ValueError(f"No patch specifications found in {spec_file}")
     logging.info("Parsed %d patch specifications from %s.", len(specs), spec_file)
@@ -518,8 +524,8 @@ if __name__ == "__main__":
     main()
 
 # python3 build_parquet_sample_dataset.py \
-#   --spec-file sample_dataset_30.txt \
-#   --output-dir /data/TCGA_parquet_sample30/ \
+#   --spec-file /data/TCGA/sample_dataset_ablation.txt \
+#   --output-dir /data/TCGA_ablations_baseline/ \
 #   --encoding jpeg \
 #   --shuffle-tasks \
 #   --num-workers 32 \

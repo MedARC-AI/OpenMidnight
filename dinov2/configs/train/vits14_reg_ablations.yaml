@@ -14,33 +14,39 @@ ibot:
   separate_head: true
   head_n_prototypes: 131072 
 train:
-  sample_list_path: /data/TCGA/sample_dataset_30.txt # gives paths to svs files for data loading if streaming_from_hf=False
+  sample_list_path: /data/TCGA/sample_dataset_ablation.txt # gives paths to svs files for data loading if streaming_from_hf=False
   streaming_from_hf: true
   streaming_dataset_path: medarc/TCGA-12K-parquet
-  batch_size_per_gpu: 384
+  batch_size_per_gpu: 128
   centering: sinkhorn_knopp
   use_pretrained: True
   OFFICIAL_EPOCH_LENGTH: 1250
   num_workers: 4
-  skip_checkpointer: false
+  skip_checkpointer: true
 student:
-  arch: vit_giant2
+  arch: vit_small
   patch_size: 14
   drop_path_rate: 0.4
-  ffn_layer: swiglufused
+  ffn_layer: mlp
   block_chunks: 4
   num_register_tokens: 4
+  layerscale: 1.0
+  interpolate_antialias: True
+  interpolate_offset: 0.0
 teacher:
   momentum_teacher: 0.994
+  warmup_teacher_temp: 0.04 
+  warmup_teacher_temp_epochs: 30
 optim:
-  epochs: 8000 
-  early_stop: 200 # we want to early stop at 200 epochs to replicate SOTA ckpt
+  epochs: 2000 
+  early_stop: 50
   weight_decay_end: 0.2
-  base_lr: 2.0e-04  # learning rate for a batch size of 1024 (swapped from 3.5e-4 to 2.0e-4)
-  warmup_epochs: 10
+  base_lr: 2.0e-4
+  warmup_epochs: 3
   layerwise_decay: 1.0
+  freeze_last_layer_epochs: 1
 crops:
   local_crops_size: 98
 evaluation:
-  eval_period_iterations: 12500 # save checkpoint every 10 epochs
+  eval_period_iterations: 2500 # save checkpoint every x iterations
   bach_root: /data/eva-data/bach

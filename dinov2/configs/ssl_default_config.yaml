@@ -63,6 +63,7 @@ train:
   dataset_path: ImageNet:split=TRAIN
   output_dir: .
   saveckp_freq: 20
+  skip_checkpointer: null  # if null, auto-skip when running on a single GPU
   seed: 0
   num_workers: 10
   OFFICIAL_EPOCH_LENGTH: 1250
@@ -116,3 +117,4 @@ crops:
   local_crops_size: 96
 evaluation:
   eval_period_iterations: 12500
+  bach_root: /data/eva-data/bach
