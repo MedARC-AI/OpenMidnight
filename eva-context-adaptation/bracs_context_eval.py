@@ -61,7 +61,7 @@ from typing import Dict, List, Literal
 import pandas as pd
 import torch
 import torch.nn as nn
-import torchvision.transforms as transforms
+from torchvision.transforms import v2
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
@@ -207,11 +207,12 @@ class BRACSContextDataset(Dataset):
             self.meta_df = self.meta_df.head(max_samples).reset_index(drop=True)
 
         # Transform
-        self.transform = transforms.Compose([
-            transforms.Resize((model_input_size, model_input_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225]),
+        self.transform = v2.Compose([
+            v2.Resize(size=model_input_size),
+            v2.CenterCrop(size=model_input_size),
+            v2.ToDtype(torch.float32, scale=True),
+            v2.Normalize(mean=[0.485, 0.456, 0.406],
+                            std=[0.229, 0.224, 0.225]),
         ])
 
         # Clean up
