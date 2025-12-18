@@ -101,4 +101,4 @@ data:
       train:
         class_path: eva.core.data.samplers.classification.BalancedSampler
         init_args:
-          num_samples: &N_SAMPLES ${oc.env:N_SAMPLES, 10}
+          num_samples: ${oc.env:N_SAMPLES, 10}

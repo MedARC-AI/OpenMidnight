@@ -36,7 +36,7 @@ N_SAMPLES=${N_SAMPLES:-100}
 AWS_ENDPOINT=${AWS_ENDPOINT} # <-- Set to your AWS S3 endpoint
 AWS_PROFILE=${AWS_PROFILE:-default} # <-- Set to your AWS profile name
 AWS_BUCKET=${AWS_BUCKET:-path-datasets}
-AWS_BRACS_ROOT=${AWS_BRACS_ROOT:-/bracs}
+AWS_BRACS_ROOT=${AWS_BRACS_ROOT:-bracs}
 
 # Model checkpoints
 BASELINE_CKPT=${BASELINE_CKPT:-/home/paul/OpenMidnight/checkpoints/teacher_epoch250000.pth}

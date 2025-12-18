@@ -169,7 +169,7 @@ class BRACSContextDataset(Dataset):
         split: str,
         mode: Literal["baseline", "context"],
         aws_endpoint: str,
-        aws_bracs_root: str = "/bracs",
+        aws_bracs_root: str = "bracs",
         aws_bucket: str = "path-datasets",
         aws_profile: str = None,
         patches_per_side: int = 16,
@@ -210,6 +210,7 @@ class BRACSContextDataset(Dataset):
         self.transform = v2.Compose([
             v2.Resize(size=model_input_size),
             v2.CenterCrop(size=model_input_size),
+            v2.ToImage(),
             v2.ToDtype(torch.float32, scale=True),
             v2.Normalize(mean=[0.485, 0.456, 0.406],
                             std=[0.229, 0.224, 0.225]),
@@ -229,14 +230,11 @@ class BRACSContextDataset(Dataset):
 
         if self.mode == "baseline":
             # Download patch image
-            patch_key = os.path.join(
-                self.aws_bracs_root, row["patch_fullpath"]
-            )
             tmp_patch = f"/tmp/{patch_name}.png"
 
             download_with_awscli(
                 self.aws_bucket,
-                patch_key,
+                os.path.join(self.aws_bracs_root, row["patch_fullpath"]),
                 tmp_patch,
                 self.aws_endpoint,
                 self.aws_profile,
@@ -266,10 +264,9 @@ class BRACSContextDataset(Dataset):
                 if os.path.exists(self.previous_wsi):
                     os.remove(self.previous_wsi)
 
-                wsi_key = os.path.join(self.aws_bracs_root, "BRACS_WSI", wsi_id)
                 download_with_awscli(
                     self.aws_bucket,
-                    wsi_key,
+                    os.path.join(self.aws_bracs_root, "BRACS_WSI", wsi_id),
                     tmp_wsi,
                     self.aws_endpoint,
                     self.aws_profile,
@@ -331,9 +328,15 @@ class BRACSContextDataset(Dataset):
             return region_tensor, target_index, label, idx
     
     def get_patch_name(self, idx: int) -> str:
+        if isinstance(idx, torch.Tensor):
+            idx = idx.item()
+
         return self.meta_df.iloc[idx]["patch_name"]
     
     def get_wsi_id(self, idx: int) -> str:
+        if isinstance(idx, torch.Tensor):
+            idx = idx.item()
+
         patch_name = self.get_patch_name(idx)
         wsi_id = "_".join(patch_name.split("_")[:2])
         return wsi_id
@@ -358,12 +361,14 @@ def generate_embeddings(
     progress = tqdm(dataloader, desc=f"{split} ({mode})")
 
     if mode == "baseline":
-        for batch_idx, (patches, labels, indices) in enumerate(progress):
+        for _, (patches, labels, indices) in enumerate(progress):
             embeddings = forward_baseline(
                 model, patches, dataloader.batch_size, device, use_amp
             )
 
-            for i, (emb, lbl, ds_idx) in enumerate(zip(embeddings, labels, indices)):
+            for _, (emb, lbl, ds_idx) in enumerate(zip(embeddings, labels, indices)):
+                lbl, ds_idx = lbl.item(), ds_idx.item()
+
                 patch_name = dataloader.dataset.get_patch_name(ds_idx)
                 emb_filename = f"{split}_{patch_name}_{ds_idx}.pt"
                 torch.save(emb.float(), emb_dir / emb_filename)
@@ -376,13 +381,15 @@ def generate_embeddings(
 
     # Context mode
     else:
-        for batch_idx, (regions, target_indices, labels, indices) in enumerate(progress):
+        for _, (regions, target_indices, labels, indices) in enumerate(progress):
             embeddings = forward_context(
                 model, regions, target_indices,
                 patch_batch_size, device, use_amp
             )
 
-            for i, (emb, lbl, ds_idx) in enumerate(zip(embeddings, labels, indices)):
+            for _, (emb, lbl, ds_idx) in enumerate(zip(embeddings, labels, indices)):
+                lbl, ds_idx = lbl.item(), ds_idx.item()
+
                 patch_name = dataloader.dataset.get_patch_name(ds_idx)
                 emb_filename = f"{split}_{patch_name}_{ds_idx}.pt"
                 torch.save(emb.float(), emb_dir / emb_filename)
@@ -527,7 +534,7 @@ def main():
     # Data paths
     parser.add_argument("--aws-bucket", default="path-datasets",
                         help="AWS S3 cloudfare bucket for downstream datasets")
-    parser.add_argument("--aws-bracs-root", default="/bracs",
+    parser.add_argument("--aws-bracs-root", default="bracs",
                         help="Path to BRACS data (BRACS_WSI, BRACS_RoI, patch_metadata.csv) in the bucket")
     parser.add_argument("--output-root", required=True,
                         help="Output directory for embeddings")
@@ -553,6 +560,11 @@ def main():
     parser.add_argument("--skip-eva-fit", action="store_true")
 
     args = parser.parse_args()
+
+    if args.aws_profile in [None, "default", ""]:
+        aws_profile = None
+    else:
+        aws_profile = args.aws_profile
 
     # Validate arguments
     if args.mode == "context":
@@ -586,7 +598,7 @@ def main():
             aws_endpoint=args.aws_endpoint,
             aws_bracs_root=args.aws_bracs_root,
             aws_bucket=args.aws_bucket,
-            aws_profile=args.aws_profile if args.aws_profile != "default" else None,
+            aws_profile=aws_profile,
             max_samples=args.max_samples,
         )
 
@@ -607,7 +619,6 @@ def main():
         )
 
         all_records.extend(records)
-        dataset.close()
 
         print(f"  Generated {len(records)} embeddings")
 
