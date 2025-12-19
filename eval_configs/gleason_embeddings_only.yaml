@@ -1,0 +1,95 @@
+---
+# GleasonArvaniti evaluation config for PRE-COMPUTED embeddings only
+# Use this with `eva fit` when you have already generated embeddings
+#
+# Required environment variables:
+#   EMBEDDINGS_ROOT: Path to directory containing manifest.csv and embeddings/
+#   MODEL_NAME: Subdirectory name under EMBEDDINGS_ROOT (e.g., "baseline_smoke")
+#
+# Example:
+#   EMBEDDINGS_ROOT=/path/to/output MODEL_NAME=baseline_smoke eva fit --config gleason_embeddings_only.yaml
+
+trainer:
+  class_path: eva.Trainer
+  init_args:
+    n_runs: &N_RUNS ${oc.env:N_RUNS, 1}
+    default_root_dir: &OUTPUT_ROOT ${oc.env:OUTPUT_ROOT, logs/${oc.env:MODEL_NAME, dino_vits16}/offline/gleason}
+    max_steps: &MAX_STEPS ${oc.env:MAX_STEPS, 12500}
+    num_sanity_val_steps: 0
+    check_val_every_n_epoch: 10
+    checkpoint_type: ${oc.env:CHECKPOINT_TYPE, best}
+    devices: ${oc.env:NUM_DEVICES, 1}
+    callbacks:
+      - class_path: eva.callbacks.ConfigurationLogger
+      - class_path: lightning.pytorch.callbacks.TQDMProgressBar
+        init_args:
+          refresh_rate: ${oc.env:TQDM_REFRESH_RATE, 1}
+      - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+        init_args:
+          logging_interval: epoch
+      - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+        init_args:
+          filename: best
+          save_last: ${oc.env:SAVE_LAST, false}
+          save_top_k: 1
+          monitor: &MONITOR_METRIC ${oc.env:MONITOR_METRIC, val/MulticlassAccuracy}
+          mode: &MONITOR_METRIC_MODE ${oc.env:MONITOR_METRIC_MODE, max}
+      - class_path: lightning.pytorch.callbacks.EarlyStopping
+        init_args:
+          min_delta: 0.0001
+          patience: ${oc.env:PATIENCE, 125}
+          monitor: *MONITOR_METRIC
+          mode: *MONITOR_METRIC_MODE
+    logger:
+      - class_path: lightning.pytorch.loggers.TensorBoardLogger
+        init_args:
+          save_dir: *OUTPUT_ROOT
+          name: ""
+model:
+  class_path: eva.HeadModule
+  init_args:
+    head:
+      class_path: torch.nn.Linear
+      init_args:
+        in_features: ${oc.env:IN_FEATURES, 1536}
+        out_features: &NUM_CLASSES 4
+    criterion: torch.nn.CrossEntropyLoss
+    optimizer:
+      class_path: torch.optim.AdamW
+      init_args:
+        lr: ${oc.env:LR_VALUE, 0.0003}
+    metrics:
+      common:
+        - class_path: eva.metrics.AverageLoss
+        - class_path: eva.metrics.MulticlassClassificationMetrics
+          init_args:
+            num_classes: *NUM_CLASSES
+
+data:
+  class_path: eva.DataModule
+  init_args:
+    datasets:
+      train:
+        class_path: eva.datasets.EmbeddingsClassificationDataset
+        init_args: &DATASET_ARGS
+          root: ${oc.env:EMBEDDINGS_ROOT}/${oc.env:MODEL_NAME}/gleason
+          manifest_file: manifest.csv
+          split: train
+      val:
+        class_path: eva.datasets.EmbeddingsClassificationDataset
+        init_args:
+          <<: *DATASET_ARGS
+          split: val
+    dataloaders:
+      train:
+        batch_size: &BATCH_SIZE ${oc.env:BATCH_SIZE, 256}
+        num_workers: &N_DATA_WORKERS ${oc.env:N_DATA_WORKERS, 4}
+        shuffle: false
+      val:
+        batch_size: *BATCH_SIZE
+        num_workers: *N_DATA_WORKERS
+    samplers:
+      train:
+        class_path: eva.core.data.samplers.classification.BalancedSampler
+        init_args:
+          num_samples: ${oc.env:N_SAMPLES, 10}
