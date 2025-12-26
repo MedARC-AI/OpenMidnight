@@ -1,0 +1,76 @@
+# Perceiver Context Adaptation Configuration
+# Trains Perceiver-based context model on 3584x3584 regions
+# Uses patch tokens (not CLS) for richer spatial context
+
+data:
+  tcga_root: /data/TCGA
+  sample_list: /data/TCGA/sample_dataset_30.txt
+  region_size: 3584  # 16x16 grid of 224x224 patches
+  patch_size: 224
+  patches_per_side: 16  # 3584 / 224 = 16
+  num_patches_per_region: 256  # 16 * 16
+
+patch_vit:
+  checkpoint: /teamspace/studios/this_studio/OpenMidnight/checkpoints/teacher_checkpoint.pth
+  arch: vit_giant2
+  patch_size: 14  # ViT internal patch size (14x14 patches)
+  embed_dim: 1536  # ViT-G/14 embedding dimension
+  num_register_tokens: 4
+  # Checkpoint architecture settings
+  block_chunks: 4
+  ffn_layer: swiglu
+  init_values: 1.0
+  freeze: true  # Keep OpenMidnight frozen
+
+# Perceiver regional compressor
+perceiver:
+  dim: 768  # Working dimension (downproject from 1536)
+  num_latents: 64  # Compress 65,280 patches → 64 tokens
+  num_layers: 6  # Perceiver transformer depth
+  num_heads: 12  # Attention heads
+  dim_head: 64  # Dimension per head (768 / 12 = 64)
+
+# Cross-attention transformer
+cross_attention:
+  depth: 4  # Number of cross-attention blocks
+  num_heads: 12  # Attention heads
+  # dim_head: 64 (inferred from perceiver.dim / num_heads)
+
+# MAE decoder
+mae_decoder:
+  embed_dim: 512  # Decoder dimension
+  depth: 2  # Decoder transformer blocks
+  num_heads: 4  # Decoder attention heads
+
+train:
+  batch_size_per_gpu: 4  # Larger than context_vit (less memory per sample)
+  num_workers: 4
+  max_iters: 10000  # Training iterations
+  output_dir: /teamspace/studios/this_studio/OpenMidnight/outputs/perceiver_context
+
+optim:
+  base_lr: 5.0e-5  # Slightly higher (more parameters to train)
+  min_lr: 1.0e-6
+  weight_decay: 0.05
+  adamw_beta1: 0.9
+  adamw_beta2: 0.999
+  clip_grad: 3.0
+
+loss:
+  # Contrastive loss
+  contrastive_weight: 1.0
+  contrastive_temperature: 0.07
+  spatial_distance_scale: 4.0  # Spatial weighting decay
+
+  # MAE loss
+  mae_weight: 1.0
+  mae_mask_ratio: 0.75  # Mask 75% of target patches
+
+evaluation:
+  save_period_iters: 500  # Save checkpoint every N iterations
+  debug_save_images: false  # Disable for now
+  debug_save_dir: /teamspace/studios/this_studio/OpenMidnight/outputs/perceiver_context/debug_images
+
+wandb:
+  project: openmidnight-perceiver
+  entity: null  # Use default
