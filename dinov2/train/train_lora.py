@@ -110,18 +110,23 @@ class LoRAQKV(nn.Module):
         self.scaling = alpha / rank
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         qkv_dim = base.out_features // 3
-        self.lora_A = nn.Linear(base.in_features, rank, bias=False)
-        self.lora_B = nn.Linear(rank, 2 * qkv_dim, bias=False)
-        nn.init.normal_(self.lora_A.weight, std=0.02)
-        nn.init.zeros_(self.lora_B.weight)
+        self.lora_A_q = nn.Linear(base.in_features, rank, bias=False)
+        self.lora_B_q = nn.Linear(rank, qkv_dim, bias=False)
+        self.lora_A_v = nn.Linear(base.in_features, rank, bias=False)
+        self.lora_B_v = nn.Linear(rank, qkv_dim, bias=False)
+        nn.init.normal_(self.lora_A_q.weight, std=0.02)
+        nn.init.zeros_(self.lora_B_q.weight)
+        nn.init.normal_(self.lora_A_v.weight, std=0.02)
+        nn.init.zeros_(self.lora_B_v.weight)
         self.base.weight.requires_grad = False
         if self.base.bias is not None:
             self.base.bias.requires_grad = False
 
     def forward(self, x):
         base_out = self.base(x)
-        delta = self.lora_B(self.lora_A(self.dropout(x))) * self.scaling
-        delta_q, delta_v = delta.chunk(2, dim=-1)
+        dropped = self.dropout(x)
+        delta_q = self.lora_B_q(self.lora_A_q(dropped)) * self.scaling
+        delta_v = self.lora_B_v(self.lora_A_v(dropped)) * self.scaling
         q, k, v = base_out.chunk(3, dim=-1)
         q = q + delta_q
         v = v + delta_v
@@ -202,9 +207,7 @@ def _apply_lora_to_attn(attn, rank, alpha, dropout):
     return 1
 
 
-def _enable_lora(cfg, model):
-    if not cfg.lora.enabled:
-        return 0, 0
+def _apply_lora_to_backbone(cfg, backbone):
     rank = cfg.lora.rank
     alpha = cfg.lora.alpha
     dropout = cfg.lora.dropout
@@ -213,6 +216,29 @@ def _enable_lora(cfg, model):
         raise ValueError("cfg.lora.rank must be > 0")
     if target not in ("mlp", "attn", "mlp+attn"):
         raise ValueError("cfg.lora.target must be one of: mlp, attn, mlp+attn")
+
+    blocks = _get_vit_blocks(backbone)
+    lora_blocks = _normalize_block_indices(cfg.lora.lora_blocks, len(blocks), "cfg.lora.lora_blocks")
+    use_mlp = target in ("mlp", "mlp+attn")
+    use_attn = target in ("attn", "mlp+attn")
+    replaced_mlp = 0
+    replaced_attn = 0
+    for idx in lora_blocks:
+        block = blocks[idx]
+        if use_mlp:
+            replaced_mlp += _apply_lora_to_mlp(block.mlp, rank, alpha, dropout)
+        if use_attn:
+            replaced_attn += _apply_lora_to_attn(block.attn, rank, alpha, dropout)
+    if use_mlp and lora_blocks and replaced_mlp == 0:
+        raise ValueError("No MLP modules found for LoRA injection")
+    if use_attn and lora_blocks and replaced_attn == 0:
+        raise ValueError("No attention modules found for LoRA injection")
+    return replaced_mlp, replaced_attn
+
+
+def _enable_lora(cfg, model):
+    if not cfg.lora.enabled:
+        return 0, 0
 
     student_backbone = model.student.backbone
     teacher_backbone = model.teacher.backbone
@@ -233,30 +259,12 @@ def _enable_lora(cfg, model):
 
     _unfreeze_layer_norms(student_backbone)
 
-    use_mlp = target in ("mlp", "mlp+attn")
-    use_attn = target in ("attn", "mlp+attn")
-    replaced_mlp = 0
-    replaced_attn = 0
-    for idx in lora_blocks:
-        block = blocks[idx]
-        if use_mlp:
-            replaced_mlp += _apply_lora_to_mlp(block.mlp, rank, alpha, dropout)
-        if use_attn:
-            replaced_attn += _apply_lora_to_attn(block.attn, rank, alpha, dropout)
-    if use_mlp and lora_blocks and replaced_mlp == 0:
-        raise ValueError("No MLP modules found for LoRA injection")
-    if use_attn and lora_blocks and replaced_attn == 0:
-        raise ValueError("No attention modules found for LoRA injection")
+    replaced_mlp, replaced_attn = _apply_lora_to_backbone(cfg, student_backbone)
 
     teacher_blocks = _get_vit_blocks(teacher_backbone)
     if len(teacher_blocks) != num_blocks:
         raise ValueError("Teacher/student block count mismatch for LoRA injection")
-    for idx in lora_blocks:
-        block = teacher_blocks[idx]
-        if use_mlp:
-            _apply_lora_to_mlp(block.mlp, rank, alpha, dropout)
-        if use_attn:
-            _apply_lora_to_attn(block.attn, rank, alpha, dropout)
+    _apply_lora_to_backbone(cfg, teacher_backbone)
     for param in teacher_backbone.parameters():
         param.requires_grad = False
 
@@ -538,6 +546,8 @@ def do_test(cfg, model, iteration): # save teacher checkpoint (used for eval onl
     bach_root = str(cfg.evaluation.bach_root)
 
     teacher, _ = build_model_from_cfg(cfg, only_teacher=True)
+    if cfg.lora.enabled:
+        _apply_lora_to_backbone(cfg, teacher)
     teacher_state = torch.load(teacher_ckp_path, map_location="cpu")["teacher"]
     teacher_state = {k.replace("module.", ""): v for k, v in teacher_state.items()}
     teacher_state = {k.replace("backbone.", ""): v for k, v in teacher_state.items() if k.startswith("backbone.")}
