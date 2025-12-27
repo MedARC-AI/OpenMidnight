@@ -1,10 +1,8 @@
 dino:
   head_n_prototypes: 131072
   head_bottleneck_dim: 384
-  do_kde: True
   kde_loss_weight: .05
   koleo_loss_weight: 0
-  do_koleo: False
 ibot:
   loss_weight: 1.0
   mask_sample_probability: 0.5 
@@ -16,7 +14,7 @@ ibot:
 train:
   sample_list_path: /data/TCGA/sample_dataset_30.txt # gives paths to svs files for data loading if streaming_from_hf=False
   streaming_from_hf: true
-  streaming_dataset_path: medarc/TCGA-12K-parquet
+  streaming_dataset_path: /data/TCGA_parquet_sample30_shuffled #medarc/TCGA-12K-parquet
   batch_size_per_gpu: 48
   centering: sinkhorn_knopp
   use_pretrained: True
@@ -42,5 +40,13 @@ optim:
 crops:
   local_crops_size: 98
 evaluation:
-  eval_period_iterations: 12500 # save checkpoint every 10 epochs
+  eval_period_iterations: 625 
   bach_root: /data/eva-data/bach
+lora:
+  enabled: true
+  rank: 64
+  alpha: 64
+  dropout: 0.0
+  target: attn # mlp+attn or attn or mlp
+  unfrozen_blocks: [0, -2, -1]
+  lora_blocks: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37]

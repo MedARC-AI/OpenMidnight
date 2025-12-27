@@ -18,6 +18,7 @@ import glob
 
 from fvcore.common.checkpoint import PeriodicCheckpointer
 import torch
+import torch.nn as nn
 
 from dinov2.data import collate_data_and_cast, DataAugmentationDINO, MaskingGenerator
 import dinov2.distributed as distributed
@@ -57,6 +58,209 @@ import wandb
 
 RUN_SCRIPT = os.environ.get("DINOV2_RUN_SCRIPT", "")
 AUGMENTATION_FILE = Path(__file__).resolve().parents[1] / "data" / "augmentations.py"
+
+class LoRALinear(nn.Module):
+    def __init__(self, base, rank, alpha, dropout):
+        super().__init__()
+        if rank <= 0:
+            raise ValueError("LoRA rank must be > 0")
+        self.base = base
+        self.rank = rank
+        self.scaling = alpha / rank
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.lora_A = nn.Linear(base.in_features, rank, bias=False)
+        self.lora_B = nn.Linear(rank, base.out_features, bias=False)
+        nn.init.normal_(self.lora_A.weight, std=0.02)
+        nn.init.zeros_(self.lora_B.weight)
+        self.base.weight.requires_grad = False
+        if self.base.bias is not None:
+            self.base.bias.requires_grad = False
+
+    def forward(self, x):
+        base_out = self.base(x)
+        delta = self.lora_B(self.lora_A(self.dropout(x))) * self.scaling
+        return base_out + delta
+
+    @property
+    def weight(self):
+        return self.base.weight
+
+    @property
+    def bias(self):
+        return self.base.bias
+
+    @property
+    def in_features(self):
+        return self.base.in_features
+
+    @property
+    def out_features(self):
+        return self.base.out_features
+
+
+class LoRAQKV(nn.Module):
+    def __init__(self, base, rank, alpha, dropout):
+        super().__init__()
+        if rank <= 0:
+            raise ValueError("LoRA rank must be > 0")
+        if base.out_features % 3 != 0:
+            raise ValueError("QKV out_features must be divisible by 3")
+        self.base = base
+        self.rank = rank
+        self.scaling = alpha / rank
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        qkv_dim = base.out_features // 3
+        self.lora_A = nn.Linear(base.in_features, rank, bias=False)
+        self.lora_B = nn.Linear(rank, 2 * qkv_dim, bias=False)
+        nn.init.normal_(self.lora_A.weight, std=0.02)
+        nn.init.zeros_(self.lora_B.weight)
+        self.base.weight.requires_grad = False
+        if self.base.bias is not None:
+            self.base.bias.requires_grad = False
+
+    def forward(self, x):
+        base_out = self.base(x)
+        delta = self.lora_B(self.lora_A(self.dropout(x))) * self.scaling
+        delta_q, delta_v = delta.chunk(2, dim=-1)
+        q, k, v = base_out.chunk(3, dim=-1)
+        q = q + delta_q
+        v = v + delta_v
+        return torch.cat((q, k, v), dim=-1)
+
+    @property
+    def weight(self):
+        return self.base.weight
+
+    @property
+    def bias(self):
+        return self.base.bias
+
+    @property
+    def in_features(self):
+        return self.base.in_features
+
+    @property
+    def out_features(self):
+        return self.base.out_features
+
+
+def _get_vit_blocks(backbone):
+    if backbone.chunked_blocks:
+        blocks = [None] * backbone.n_blocks
+        for chunk in backbone.blocks:
+            for idx, blk in enumerate(chunk):
+                if not isinstance(blk, nn.Identity):
+                    blocks[idx] = blk
+        if any(blk is None for blk in blocks):
+            raise ValueError("Failed to resolve all ViT blocks from chunked backbone")
+        return blocks
+    return list(backbone.blocks)
+
+
+def _normalize_block_indices(indices, num_blocks, name):
+    resolved = []
+    for raw_idx in indices:
+        if not isinstance(raw_idx, int):
+            raise ValueError(f"{name} must be a list of ints")
+        idx = raw_idx + num_blocks if raw_idx < 0 else raw_idx
+        if idx < 0 or idx >= num_blocks:
+            raise ValueError(f"{name} index out of range: {raw_idx}")
+        resolved.append(idx)
+    if len(resolved) != len(set(resolved)):
+        raise ValueError(f"{name} has duplicate indices")
+    return resolved
+
+
+def _unfreeze_layer_norms(module):
+    for submodule in module.modules():
+        if isinstance(submodule, nn.LayerNorm):
+            for param in submodule.parameters():
+                param.requires_grad = True
+
+
+def _apply_lora_to_mlp(mlp, rank, alpha, dropout):
+    if hasattr(mlp, "fc1") and hasattr(mlp, "fc2"):
+        mlp.fc1 = LoRALinear(mlp.fc1, rank, alpha, dropout)
+        mlp.fc2 = LoRALinear(mlp.fc2, rank, alpha, dropout)
+        return 1
+    if hasattr(mlp, "w12") and hasattr(mlp, "w3"):
+        mlp.w12 = LoRALinear(mlp.w12, rank, alpha, dropout)
+        mlp.w3 = LoRALinear(mlp.w3, rank, alpha, dropout)
+        return 1
+    if hasattr(mlp, "w1") and hasattr(mlp, "w2") and hasattr(mlp, "w3"):
+        mlp.w1 = LoRALinear(mlp.w1, rank, alpha, dropout)
+        mlp.w2 = LoRALinear(mlp.w2, rank, alpha, dropout)
+        mlp.w3 = LoRALinear(mlp.w3, rank, alpha, dropout)
+        return 1
+    raise ValueError("Unsupported MLP module for LoRA injection")
+
+
+def _apply_lora_to_attn(attn, rank, alpha, dropout):
+    if not hasattr(attn, "qkv"):
+        raise ValueError("Attention module missing qkv for LoRA injection")
+    attn.qkv = LoRAQKV(attn.qkv, rank, alpha, dropout)
+    return 1
+
+
+def _enable_lora(cfg, model):
+    if not cfg.lora.enabled:
+        return 0, 0
+    rank = cfg.lora.rank
+    alpha = cfg.lora.alpha
+    dropout = cfg.lora.dropout
+    target = cfg.lora.target
+    if rank <= 0:
+        raise ValueError("cfg.lora.rank must be > 0")
+    if target not in ("mlp", "attn", "mlp+attn"):
+        raise ValueError("cfg.lora.target must be one of: mlp, attn, mlp+attn")
+
+    student_backbone = model.student.backbone
+    teacher_backbone = model.teacher.backbone
+    blocks = _get_vit_blocks(student_backbone)
+    num_blocks = len(blocks)
+    unfrozen_blocks = _normalize_block_indices(cfg.lora.unfrozen_blocks, num_blocks, "cfg.lora.unfrozen_blocks")
+    lora_blocks = _normalize_block_indices(cfg.lora.lora_blocks, num_blocks, "cfg.lora.lora_blocks")
+    overlap = set(unfrozen_blocks) & set(lora_blocks)
+    if overlap:
+        raise ValueError(f"Blocks cannot be both unfrozen and LoRA-tunable: {sorted(overlap)}")
+
+    for param in student_backbone.parameters():
+        param.requires_grad = False
+
+    for idx in unfrozen_blocks:
+        for param in blocks[idx].parameters():
+            param.requires_grad = True
+
+    _unfreeze_layer_norms(student_backbone)
+
+    use_mlp = target in ("mlp", "mlp+attn")
+    use_attn = target in ("attn", "mlp+attn")
+    replaced_mlp = 0
+    replaced_attn = 0
+    for idx in lora_blocks:
+        block = blocks[idx]
+        if use_mlp:
+            replaced_mlp += _apply_lora_to_mlp(block.mlp, rank, alpha, dropout)
+        if use_attn:
+            replaced_attn += _apply_lora_to_attn(block.attn, rank, alpha, dropout)
+    if use_mlp and lora_blocks and replaced_mlp == 0:
+        raise ValueError("No MLP modules found for LoRA injection")
+    if use_attn and lora_blocks and replaced_attn == 0:
+        raise ValueError("No attention modules found for LoRA injection")
+
+    teacher_blocks = _get_vit_blocks(teacher_backbone)
+    if len(teacher_blocks) != num_blocks:
+        raise ValueError("Teacher/student block count mismatch for LoRA injection")
+    for idx in lora_blocks:
+        block = teacher_blocks[idx]
+        if use_mlp:
+            _apply_lora_to_mlp(block.mlp, rank, alpha, dropout)
+        if use_attn:
+            _apply_lora_to_attn(block.attn, rank, alpha, dropout)
+    for param in teacher_backbone.parameters():
+        param.requires_grad = False
+
+    return replaced_mlp, replaced_attn
 
 def _build_streaming_dataset(
     dataset_path: str,
@@ -1220,6 +1424,7 @@ def main(args):
     #Load model here from pretrained.
     if cfg.train.use_pretrained:
         _load_pretrained_backbone(cfg, model)
+    _enable_lora(cfg, model)
 
     model.prepare_for_distributed_training()
     logger.info("Model:\n{}".format(model))

@@ -12,8 +12,8 @@ export NODE_RANK=0 # the node running this script will be master node (rank 0)
 
 # Training config
 CONFIG_FILE="./dinov2/configs/train/vitg14_reg4.yaml"
-OUTPUT_DIR="./output_vitg14"
-RESUME="True" # set string to "True" to resume from last checkpoint in OUTPUT_DIR if it exists
+OUTPUT_DIR="./output_vitg14_lora"
+RESUME="False" # set string to "True" to resume from last checkpoint in OUTPUT_DIR if it exists
 
 # Set Python path for imports
 # Provide script path so train.py can attach the right launcher script to WandB.
@@ -46,7 +46,7 @@ uv run torchrun \
   --node_rank "${NODE_RANK}" \
   --master_addr "${MASTER_ADDR}" \
   --master_port "${MASTER_PORT}" \
-  dinov2/train/train.py \
+  dinov2/train/train_lora.py \
   --config-file "${CONFIG_FILE}" \
   --output-dir "${OUTPUT_DIR}" \
   ${RESUME_FLAG} 

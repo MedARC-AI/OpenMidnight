@@ -118,3 +118,5 @@ crops:
 evaluation:
   eval_period_iterations: 12500
   bach_root: /data/eva-data/bach
+  breakhis_root: /data/eva-data/breakhis
+  pcam_root: /data/eva-data/patch_camelyon
