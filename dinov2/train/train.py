@@ -1197,7 +1197,8 @@ def do_train(cfg, model, resume=False):
     fp16_scaler = model.fp16_scaler  # for mixed precision training
     if distributed.is_main_process():
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"Trainable parameters: {trainable_params}")
+        logger.info("Trainable parameters: %s", trainable_params)
+        print(f"Trainable parameters: {trainable_params}", flush=True)
     if cfg.train.skip_checkpointer:
         print(f"\n\nSkipping FSDP checkpointer (cfg.train.skip_checkpointer={cfg.train.skip_checkpointer})\n\n")
 
