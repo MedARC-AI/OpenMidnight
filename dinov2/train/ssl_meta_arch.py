@@ -5,6 +5,8 @@
 
 from functools import partial
 import logging
+from pathlib import Path
+import sys
 
 import torch
 from torch import nn
@@ -416,3 +418,149 @@ class SSLMetaArch(nn.Module):
             self.student[k] = get_fsdp_wrapper(student_model_cfg, modules_to_wrap={BlockChunk})(self.student[k])
             teacher_model_cfg = self.cfg.compute_precision.teacher[k]
             self.teacher[k] = get_fsdp_wrapper(teacher_model_cfg, modules_to_wrap={BlockChunk})(self.teacher[k])
+
+
+class ProjectionMLP(nn.Module):
+    def __init__(self, in_dim, hidden_dim, out_dim, nlayers, norm):
+        super().__init__()
+        if nlayers < 1:
+            raise ValueError("proj_nlayers must be >= 1")
+
+        layers = []
+        dim = in_dim
+        for _ in range(nlayers - 1):
+            layers.append(nn.Linear(dim, hidden_dim, bias=False))
+            if norm == "batchnorm":
+                layers.append(nn.BatchNorm1d(hidden_dim))
+            elif norm == "layernorm":
+                layers.append(nn.LayerNorm(hidden_dim))
+            else:
+                raise ValueError("proj_norm must be 'batchnorm' or 'layernorm'")
+            layers.append(nn.GELU())
+            dim = hidden_dim
+        layers.append(nn.Linear(dim, out_dim, bias=True))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class LeJEPAMetaArch(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.fp16_scaler = ShardedGradScaler() if cfg.compute_precision.grad_scaler else None
+
+        lejepa_root = Path("/home/paul/lejepa")
+        sys.path.insert(0, str(lejepa_root))
+        import lejepa
+
+        student_backbone, _, embed_dim = build_model_from_cfg(cfg)
+        projector = ProjectionMLP(
+            embed_dim,
+            cfg.lejepa.proj_hidden_dim,
+            cfg.lejepa.proj_dim,
+            cfg.lejepa.proj_nlayers,
+            cfg.lejepa.proj_norm,
+        )
+        self.student = nn.ModuleDict({"backbone": student_backbone, "projector": projector})
+        self.embed_dim = embed_dim
+        univariate_test = lejepa.univariate.EppsPulley(
+            t_max=cfg.lejepa.t_max,
+            n_points=cfg.lejepa.n_points,
+        )
+        self.sigreg = lejepa.multivariate.SlicingUnivariateTest(
+            univariate_test=univariate_test,
+            num_slices=cfg.lejepa.num_slices,
+        )
+
+    @property
+    def backbone(self):
+        return self.student["backbone"]
+
+    @property
+    def projector(self):
+        return self.student["projector"]
+
+    def forward(self, inputs):
+        raise NotImplementedError
+
+    def backprop_loss(self, loss):
+        if self.fp16_scaler is not None:
+            self.fp16_scaler.scale(loss).backward()
+        else:
+            loss.backward()
+
+    def forward_backward(self, images, teacher_temp=None):
+        n_global_crops = 2
+        n_local_crops = self.cfg.crops.local_crops_number
+
+        global_crops = images["collated_global_crops"].cuda(non_blocking=True)
+        batch_size = global_crops.shape[0] // n_global_crops
+        if n_local_crops > 0:
+            local_crops = images["collated_local_crops"].cuda(non_blocking=True)
+        else:
+            local_crops = None
+
+        global_out = self.backbone(global_crops, is_training=True)["x_norm_clstoken"]
+        global_out = global_out.view(n_global_crops, batch_size, -1)
+        if n_local_crops > 0:
+            local_out = self.backbone(local_crops, is_training=True)["x_norm_clstoken"]
+            local_out = local_out.view(n_local_crops, batch_size, -1)
+            all_out = torch.cat([global_out, local_out], dim=0)
+        else:
+            all_out = global_out
+
+        proj = self.projector(all_out.flatten(0, 1))
+        proj = proj.view(all_out.shape[0], batch_size, -1).float()
+        centers = proj[:n_global_crops].mean(dim=0)
+        pred_loss = (centers - proj).square().mean()
+
+        sigreg_loss = proj.new_zeros(())
+        for v in range(proj.shape[0]):
+            sigreg_loss = sigreg_loss + self.sigreg(proj[v])
+        sigreg_loss = sigreg_loss / proj.shape[0]
+
+        base_lejepa_loss = (1.0 - self.cfg.lejepa.lambd) * pred_loss + self.cfg.lejepa.lambd * sigreg_loss
+        lejepa_loss = base_lejepa_loss
+
+        self.backprop_loss(lejepa_loss)
+
+        return {
+            "pred_loss": pred_loss.detach(),
+            "sigreg_loss": sigreg_loss.detach(),
+            "base_lejepa_loss": base_lejepa_loss.detach(),
+            "lejepa_loss": lejepa_loss.detach(),
+        }
+
+    def update_teacher(self, m):
+        return
+
+    def get_maybe_fused_params_for_submodel(self, m):
+        params_groups = get_params_groups_with_decay(
+            model=m,
+            lr_decay_rate=self.cfg.optim.layerwise_decay,
+            patch_embed_lr_mult=self.cfg.optim.patch_embed_lr_mult,
+        )
+        fused_params_groups = fuse_params_groups(params_groups)
+        for g in fused_params_groups:
+            g["foreach"] = True
+        return fused_params_groups
+
+    def get_params_groups(self):
+        all_params_groups = []
+        for m in self.student.values():
+            all_params_groups += self.get_maybe_fused_params_for_submodel(m)
+        return all_params_groups
+
+    def prepare_for_distributed_training(self):
+        logger.info("DISTRIBUTED FSDP -- preparing model for distributed training")
+        if has_batchnorms(self.student):
+            raise NotImplementedError
+        student_cfg = self.cfg.compute_precision.student
+        self.student["backbone"] = get_fsdp_wrapper(student_cfg.backbone, modules_to_wrap={BlockChunk})(
+            self.student["backbone"]
+        )
+        self.student["projector"] = get_fsdp_wrapper(student_cfg.dino_head, modules_to_wrap={BlockChunk})(
+            self.student["projector"]
+        )

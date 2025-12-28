@@ -11,7 +11,17 @@ ibot:
     - 0.45 
   separate_head: true
   head_n_prototypes: 131072 
+lejepa:
+  lambd: 0.05
+  num_slices: 1024
+  t_max: 3.0
+  n_points: 17
+  proj_dim: 256
+  proj_hidden_dim: 2048
+  proj_nlayers: 3
+  proj_norm: layernorm
 train:
+  objective: dinov2 # dinov2 or lejepa
   sample_list_path: /data/TCGA/sample_dataset_30.txt # gives paths to svs files for data loading if streaming_from_hf=False
   streaming_from_hf: true
   streaming_dataset_path: /data/TCGA_parquet_sample30_shuffled #medarc/TCGA-12K-parquet
@@ -34,7 +44,7 @@ optim:
   epochs: 8000 
   early_stop: 200 # we want to early stop at 200 epochs to replicate SOTA ckpt
   weight_decay_end: 0.2
-  base_lr: 2.0e-04  # learning rate for a batch size of 1024 (swapped from 3.5e-4 to 2.0e-4)
+  base_lr: 2.0e-03 # 2.0e-04  # learning rate for a batch size of 1024 (swapped from 3.5e-4 to 2.0e-4)
   warmup_epochs: 10
   layerwise_decay: 1.0
 crops:

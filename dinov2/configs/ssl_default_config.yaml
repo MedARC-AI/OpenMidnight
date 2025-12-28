@@ -58,7 +58,17 @@ ibot:
   head_bottleneck_dim: 256
   head_nlayers: 3
   head_hidden_dim: 2048
+lejepa:
+  lambd: 0.05
+  num_slices: 1024
+  t_max: 3.0
+  n_points: 17
+  proj_dim: 256
+  proj_hidden_dim: 2048
+  proj_nlayers: 3
+  proj_norm: layernorm
 train:
+  objective: dinov2
   batch_size_per_gpu: 64
   dataset_path: ImageNet:split=TRAIN
   output_dir: .
