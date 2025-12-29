@@ -409,3 +409,17 @@ def vit_giant2(patch_size=16, num_register_tokens=0, **kwargs):
         **kwargs,
     )
     return model
+
+
+def vit_5b(patch_size=16, num_register_tokens=0, **kwargs):
+    model = DinoVisionTransformer(
+        patch_size=patch_size,
+        embed_dim=3072,
+        depth=48,
+        num_heads=32,
+        mlp_ratio=4,
+        block_fn=partial(Block, attn_class=MemEffAttention),
+        num_register_tokens=num_register_tokens,
+        **kwargs,
+    )
+    return model

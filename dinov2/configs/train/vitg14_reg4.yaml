@@ -25,7 +25,7 @@ model:
 train:
   objective: lejepa # dinov2 or lejepa
   pretrained_source: dinov3 # dinov2, dinov3, or pixio
-  pretrained_ckpt: /home/paul/dinov3/checkpoints/dinov3_vit7b16_saved_teacher.pth # dinov3: /home/paul/dinov3/checkpoints/dinov3_vit7b16_saved_teacher.pth | pixio: /home/paul/path-pixio/pretrained_ckpts/pixio_vith16.pth
+  pretrained_ckpt: /home/paul/dinov3/checkpoints/dinov3_vit7b16_saved_teacher.pth # dinov3: /home/paul/dinov3/checkpoints/dinov3_vit7b16_saved_teacher.pth | pixio: /home/paul/path-pixio/pretrained_ckpts/pixio_vith16.pth | pixio 5b: /home/paul/path-pixio/pretrained_ckpts/pixio_vit5b16.pth
   sample_list_path: /data/TCGA/sample_dataset_30.txt # gives paths to svs files for data loading if streaming_from_hf=False
   streaming_from_hf: true
   streaming_dataset_path: /data/TCGA_parquet_sample30_shuffled #medarc/TCGA-12K-parquet
@@ -45,6 +45,14 @@ train:
 #   layerscale: 1.0e-05 
 # student: #pixio
 #   arch: vit_huge 
+#   patch_size: 16
+#   drop_path_rate: 0.0
+#   ffn_layer: mlp
+#   block_chunks: 4
+#   num_register_tokens: 7
+#   layerscale: 0.0
+# student: #pixio vit5b16
+#   arch: vit_5b
 #   patch_size: 16
 #   drop_path_rate: 0.0
 #   ffn_layer: mlp
@@ -106,5 +114,8 @@ lora:
   target: attn # mlp+attn or attn or mlp
   unfrozen_blocks: [-2, -1]
   # lora_blocks: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29] # pixio vit huge
+  # lora_blocks: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45] # pixio 5b
+  # lora_blocks: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47] # pixio vit5b
   # lora_blocks: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37] # dinov2 giant
   lora_blocks: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37] # dinov3 vit7b
+  
