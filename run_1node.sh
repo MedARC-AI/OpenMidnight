@@ -12,7 +12,7 @@ export NODE_RANK=0 # the node running this script will be master node (rank 0)
 
 # Training config
 CONFIG_FILE="./dinov2/configs/train/vitg14_reg4.yaml"
-OUTPUT_DIR="./output_vitg14_lora_2e-3"
+OUTPUT_DIR="./output_vitg14_lora_jepa"
 RESUME="False" # set string to "True" to resume from last checkpoint in OUTPUT_DIR if it exists
 
 # Set Python path for imports

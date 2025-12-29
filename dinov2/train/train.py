@@ -28,6 +28,7 @@ from dinov2.utils.config import setup
 from dinov2.utils.utils import CosineScheduler
 
 from dinov2.train.ssl_meta_arch import SSLMetaArch, LeJEPAMetaArch
+from dinov2.train.jepa_logging import JEPALogger
 from dinov2.models import build_model_from_cfg
 from datasets import IterableDatasetDict, load_dataset, DownloadConfig
 from PIL import Image, ImageOps
@@ -70,7 +71,7 @@ class LoRALinear(nn.Module):
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         self.lora_A = nn.Linear(base.in_features, rank, bias=False)
         self.lora_B = nn.Linear(rank, base.out_features, bias=False)
-        nn.init.normal_(self.lora_A.weight, std=0.02)
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B.weight)
         self.base.weight.requires_grad = False
         if self.base.bias is not None:
@@ -114,9 +115,9 @@ class LoRAQKV(nn.Module):
         self.lora_B_q = nn.Linear(rank, qkv_dim, bias=False)
         self.lora_A_v = nn.Linear(base.in_features, rank, bias=False)
         self.lora_B_v = nn.Linear(rank, qkv_dim, bias=False)
-        nn.init.normal_(self.lora_A_q.weight, std=0.02)
+        nn.init.kaiming_uniform_(self.lora_A_q.weight, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B_q.weight)
-        nn.init.normal_(self.lora_A_v.weight, std=0.02)
+        nn.init.kaiming_uniform_(self.lora_A_v.weight, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B_v.weight)
         self.base.weight.requires_grad = False
         if self.base.bias is not None:
@@ -378,7 +379,7 @@ def build_optimizer(cfg, params_groups):
     return torch.optim.AdamW(params_groups, betas=(cfg.optim.adamw_beta1, cfg.optim.adamw_beta2))
 
 
-def build_schedulers(cfg):
+def build_schedulers(cfg, objective):
     OFFICIAL_EPOCH_LENGTH = cfg.train.OFFICIAL_EPOCH_LENGTH
     lr = dict(
         base_value=cfg.optim["lr"],
@@ -392,23 +393,26 @@ def build_schedulers(cfg):
         final_value=cfg.optim["weight_decay_end"],
         total_iters=cfg.optim["epochs"] * OFFICIAL_EPOCH_LENGTH,
     )
-    momentum = dict(
-        base_value=cfg.teacher["momentum_teacher"],
-        final_value=cfg.teacher["final_momentum_teacher"],
-        total_iters=cfg.optim["epochs"] * OFFICIAL_EPOCH_LENGTH,
-    )
-    teacher_temp = dict(
-        base_value=cfg.teacher["teacher_temp"],
-        final_value=cfg.teacher["teacher_temp"],
-        total_iters=cfg.teacher["warmup_teacher_temp_epochs"] * OFFICIAL_EPOCH_LENGTH,
-        warmup_iters=cfg.teacher["warmup_teacher_temp_epochs"] * OFFICIAL_EPOCH_LENGTH,
-        start_warmup_value=cfg.teacher["warmup_teacher_temp"],
-    )
 
     lr_schedule = CosineScheduler(**lr)
     wd_schedule = CosineScheduler(**wd)
-    momentum_schedule = CosineScheduler(**momentum)
-    teacher_temp_schedule = CosineScheduler(**teacher_temp)
+    momentum_schedule = None
+    teacher_temp_schedule = None
+    if objective == "dinov2":
+        momentum = dict(
+            base_value=cfg.teacher["momentum_teacher"],
+            final_value=cfg.teacher["final_momentum_teacher"],
+            total_iters=cfg.optim["epochs"] * OFFICIAL_EPOCH_LENGTH,
+        )
+        teacher_temp = dict(
+            base_value=cfg.teacher["teacher_temp"],
+            final_value=cfg.teacher["teacher_temp"],
+            total_iters=cfg.teacher["warmup_teacher_temp_epochs"] * OFFICIAL_EPOCH_LENGTH,
+            warmup_iters=cfg.teacher["warmup_teacher_temp_epochs"] * OFFICIAL_EPOCH_LENGTH,
+            start_warmup_value=cfg.teacher["warmup_teacher_temp"],
+        )
+        momentum_schedule = CosineScheduler(**momentum)
+        teacher_temp_schedule = CosineScheduler(**teacher_temp)
     last_layer_lr_schedule = CosineScheduler(**lr)
 
     last_layer_lr_schedule.schedule[
@@ -1211,7 +1215,7 @@ def do_train(cfg, model, resume=False):
         momentum_schedule,
         teacher_temp_schedule,
         last_layer_lr_schedule,
-    ) = build_schedulers(cfg)
+    ) = build_schedulers(cfg, objective)
     
     from omegaconf import OmegaConf
     if distributed.is_main_process():
@@ -1231,12 +1235,17 @@ def do_train(cfg, model, resume=False):
             resume=resume_mode,
         )
         repo_root = Path(__file__).resolve().parents[2]
-        artifact = wandb.Artifact(name=f"run-source-{run.id}", type="code")
-        artifact.add_file(str(Path(__file__).resolve()))
-        artifact.add_file(str(AUGMENTATION_FILE))
-        artifact.add_file(str(os.environ.get("DINOV2_RUN_SCRIPT")))
-        artifact.add_file(str(Path(CONFIG_FILE_PATH)))
-        run.log_artifact(artifact)
+        files_to_save = [
+            Path(__file__).resolve(),
+            AUGMENTATION_FILE,
+            Path(CONFIG_FILE_PATH),
+        ]
+        run_script = os.environ.get("DINOV2_RUN_SCRIPT")
+        if run_script:
+            files_to_save.append(Path(run_script).resolve())
+        for src in files_to_save:
+            base_path = repo_root if src.is_relative_to(repo_root) else src.parent
+            run.save(str(src), base_path=str(base_path), policy="now")
 
     # checkpointer
     if not cfg.train.skip_checkpointer:
@@ -1403,6 +1412,8 @@ def do_train(cfg, model, resume=False):
             collate_fn=collate_fn,
         )
 
+    jepa_logger = JEPALogger(cfg) if objective == "lejepa" else None
+
     # training loop
 
     iteration = start_iter
@@ -1419,6 +1430,11 @@ def do_train(cfg, model, resume=False):
         eta_target_iter + 1,
         start_iter,
     ):
+        iter_start = None
+        data_time = None
+        log_heavy = False
+        if objective == "lejepa":
+            iter_start, data_time, log_heavy = jepa_logger.start_iter(iteration)
         if iteration >= early_stop_iter:
             logger.info("Early stopping at iteration {}".format(iteration))
             if cfg.evaluation.eval_period_iterations >= 0:
@@ -1450,8 +1466,11 @@ def do_train(cfg, model, resume=False):
 
         lr = lr_schedule[iteration]
         wd = wd_schedule[iteration]
-        mom = momentum_schedule[iteration]
-        teacher_temp = teacher_temp_schedule[iteration]
+        mom = None
+        teacher_temp = None
+        if objective == "dinov2":
+            mom = momentum_schedule[iteration]
+            teacher_temp = teacher_temp_schedule[iteration]
         last_layer_lr = last_layer_lr_schedule[iteration]
         apply_optim_scheduler(optimizer, lr, wd, last_layer_lr)
 
@@ -1464,28 +1483,88 @@ def do_train(cfg, model, resume=False):
         # clip gradients
 
         if fp16_scaler is not None:
-            if cfg.optim.clip_grad:
+            if objective == "lejepa":
                 fp16_scaler.unscale_(optimizer)
-                for v in model.student.values():
-                    v.clip_grad_norm_(cfg.optim.clip_grad)
-            fp16_scaler.step(optimizer)
-            fp16_scaler.update()
+                grad_norm_backbone, grad_norm_projector = jepa_logger.module_norms(
+                    model.backbone, model.projector, use_grad=True
+                )
+                if cfg.optim.clip_grad:
+                    for v in model.student.values():
+                        v.clip_grad_norm_(cfg.optim.clip_grad)
+                fp16_scaler.step(optimizer)
+                fp16_scaler.update()
+                amp_scale = fp16_scaler.get_scale()
+            else:
+                if cfg.optim.clip_grad:
+                    fp16_scaler.unscale_(optimizer)
+                    for v in model.student.values():
+                        v.clip_grad_norm_(cfg.optim.clip_grad)
+                fp16_scaler.step(optimizer)
+                fp16_scaler.update()
         else:
-            if cfg.optim.clip_grad:
-                for v in model.student.values():
-                    v.clip_grad_norm_(cfg.optim.clip_grad)
-            optimizer.step()
+            if objective == "lejepa":
+                grad_norm_backbone, grad_norm_projector = jepa_logger.module_norms(
+                    model.backbone, model.projector, use_grad=True
+                )
+                if cfg.optim.clip_grad:
+                    for v in model.student.values():
+                        v.clip_grad_norm_(cfg.optim.clip_grad)
+                optimizer.step()
+                amp_scale = 1.0
+            else:
+                if cfg.optim.clip_grad:
+                    for v in model.student.values():
+                        v.clip_grad_norm_(cfg.optim.clip_grad)
+                optimizer.step()
 
         # perform teacher EMA update
 
-        model.update_teacher(mom)
+        if objective == "dinov2":
+            model.update_teacher(mom)
 
         # logging
 
-        if distributed.get_global_size() > 1:
-            for v in loss_dict.values():
-                torch.distributed.all_reduce(v)
-        loss_dict_reduced = {k: v.item() / distributed.get_global_size() for k, v in loss_dict.items()}
+        if objective == "lejepa":
+            proj = model._last_proj
+            centers = model._last_centers
+            n_global_crops = model._last_n_global_crops
+            n_local_crops = model._last_n_local_crops
+            metrics_tensors, heavy_stats, proj_hist = jepa_logger.compute_proj_stats(
+                proj,
+                centers,
+                n_global_crops,
+                n_local_crops,
+                log_heavy,
+            )
+            param_norm_backbone, param_norm_projector = jepa_logger.module_norms(
+                model.backbone, model.projector, use_grad=False
+            )
+            loss_dict_reduced, _ = jepa_logger.log_step(
+                iteration=iteration,
+                loss_dict=loss_dict,
+                metrics_tensors=metrics_tensors,
+                heavy_stats=heavy_stats,
+                proj_hist=proj_hist,
+                optimizer=optimizer,
+                lr=lr,
+                wd=wd,
+                amp_scale=amp_scale,
+                grad_norm_backbone=grad_norm_backbone,
+                grad_norm_projector=grad_norm_projector,
+                param_norm_backbone=param_norm_backbone,
+                param_norm_projector=param_norm_projector,
+                batch_size=proj.shape[1],
+                n_global_crops=n_global_crops,
+                n_local_crops=n_local_crops,
+                iter_start=iter_start,
+                data_time=data_time,
+            )
+            jepa_logger.finish_iter()
+        else:
+            if distributed.get_global_size() > 1:
+                for v in loss_dict.values():
+                    torch.distributed.all_reduce(v)
+            loss_dict_reduced = {k: v.item() / distributed.get_global_size() for k, v in loss_dict.items()}
 
         if math.isnan(sum(loss_dict_reduced.values())):
             print(sum(loss_dict_reduced.values()))
@@ -1504,18 +1583,20 @@ def do_train(cfg, model, resume=False):
 
         metric_logger.update(lr=lr)
         metric_logger.update(wd=wd)
-        metric_logger.update(mom=mom)
+        if objective == "dinov2":
+            metric_logger.update(mom=mom)
         metric_logger.update(last_layer_lr=last_layer_lr)
         metric_logger.update(current_batch_size=current_batch_size)
         metric_logger.update(total_loss=losses_reduced, **loss_dict_reduced)
         
-        if distributed.is_main_process():
+        if distributed.is_main_process() and objective == "dinov2":
             scalar_logs = {
                 "Learning Rate": lr,
-                "Momentum": mom,
                 "Last Layer LR": last_layer_lr,
                 "Total Loss": losses_reduced,
             }
+            if objective == "dinov2":
+                scalar_logs["Momentum"] = mom
             wandb.log({**scalar_logs, **loss_dict_reduced}, step=iteration)
     
         # Synchronize the GPU to ensure all operations are complete before measuring

@@ -455,7 +455,7 @@ class LeJEPAMetaArch(nn.Module):
         sys.path.insert(0, str(lejepa_root))
         import lejepa
 
-        student_backbone, _, embed_dim = build_model_from_cfg(cfg)
+        student_backbone, _, embed_dim = build_model_from_cfg(cfg, only_student=True)
         projector = ProjectionMLP(
             embed_dim,
             cfg.lejepa.proj_hidden_dim,
@@ -523,6 +523,10 @@ class LeJEPAMetaArch(nn.Module):
 
         base_lejepa_loss = (1.0 - self.cfg.lejepa.lambd) * pred_loss + self.cfg.lejepa.lambd * sigreg_loss
         lejepa_loss = base_lejepa_loss
+        self._last_proj = proj.detach()
+        self._last_centers = centers.detach()
+        self._last_n_global_crops = n_global_crops
+        self._last_n_local_crops = n_local_crops
 
         self.backprop_loss(lejepa_loss)
 
