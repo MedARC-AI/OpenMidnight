@@ -1508,7 +1508,10 @@ def do_train(cfg, model, resume=False):
         sample_list_path = str(cfg.train.sample_list_path)
         if not sample_list_path:
             raise ValueError("cfg.train.sample_list_path must be set when streaming_from_hf is False")
-        dataset_str = f"pathology:root=/data/TCGA/:sample_list_path={sample_list_path}"
+        dataset_root = str(cfg.train.dataset_root)
+        if not dataset_root:
+            raise ValueError("cfg.train.dataset_root must be set when streaming_from_hf is False")
+        dataset_str = f"pathology:root={dataset_root}:sample_list_path={sample_list_path}"
         dataset = make_dataset(
             dataset_str=dataset_str,
             transform=data_transform,

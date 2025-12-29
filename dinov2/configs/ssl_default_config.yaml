@@ -73,6 +73,7 @@ train:
   objective: dinov2
   batch_size_per_gpu: 64
   dataset_path: ImageNet:split=TRAIN
+  dataset_root: ""
   output_dir: .
   saveckp_freq: 20
   skip_checkpointer: null  # if null, auto-skip when running on a single GPU

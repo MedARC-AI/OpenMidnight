@@ -5,12 +5,13 @@
 
 import logging
 import sys
+from pathlib import Path
 
 from . import vision_transformer as vits
 
 
 logger = logging.getLogger("dinov2")
-_DINOV3_REPO = "/home/paul/dinov3"
+_DINOV3_REPO = str(Path(__file__).resolve().parents[2].parent / "dinov3")
 
 
 def build_model(args, only_teacher=False, only_student=False, img_size=224):

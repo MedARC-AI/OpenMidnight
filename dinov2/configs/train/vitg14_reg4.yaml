@@ -26,6 +26,7 @@ train:
   objective: lejepa # dinov2 or lejepa
   pretrained_source: dinov3 # dinov2, dinov3, or pixio
   pretrained_ckpt: /home/paul/dinov3/checkpoints/dinov3_vit7b16_saved_teacher.pth # dinov3: /home/paul/dinov3/checkpoints/dinov3_vit7b16_saved_teacher.pth | pixio: /home/paul/path-pixio/pretrained_ckpts/pixio_vith16.pth | pixio 5b: /home/paul/path-pixio/pretrained_ckpts/pixio_vit5b16.pth
+  dataset_root: /data/TCGA
   sample_list_path: /data/TCGA/sample_dataset_30.txt # gives paths to svs files for data loading if streaming_from_hf=False
   streaming_from_hf: true
   streaming_dataset_path: /data/TCGA_parquet_sample30_shuffled #medarc/TCGA-12K-parquet
@@ -90,7 +91,7 @@ optim:
   epochs: 8000 
   early_stop: 200 # we want to early stop at 200 epochs to replicate SOTA ckpt
   weight_decay_end: 0.2
-  base_lr: 8.0e-05  # learning rate for a batch size of 1024 (swapped from 3.5e-4 to 2.0e-4)
+  base_lr: 1.0e-03  # learning rate for a batch size of 1024 (swapped from 3.5e-4 to 2.0e-4)
   warmup_epochs: 10
   layerwise_decay: 1.0
 crops:
@@ -106,6 +107,8 @@ crops:
 evaluation:
   eval_period_iterations: 625 
   bach_root: /data/eva-data/bach
+  breakhis_root: /data/eva-data/breakhis
+  pcam_root: /data/eva-data/patch_camelyon
 lora:
   enabled: true
   rank: 64

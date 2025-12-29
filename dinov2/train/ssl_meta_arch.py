@@ -451,7 +451,7 @@ class LeJEPAMetaArch(nn.Module):
         self.cfg = cfg
         self.fp16_scaler = ShardedGradScaler() if cfg.compute_precision.grad_scaler else None
 
-        lejepa_root = Path("/home/paul/lejepa")
+        lejepa_root = Path(__file__).resolve().parents[2].parent / "lejepa"
         sys.path.insert(0, str(lejepa_root))
         import lejepa
 
