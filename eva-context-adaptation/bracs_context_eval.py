@@ -185,7 +185,7 @@ class S3BRACSBackend(BRACSBackend):
         return tmp
 
     def get_wsi(self, wsi_id):
-        tmp = os.path.join(self._tmp_dir, f"bracs_wsi{Path(wsi_id).suffix}")
+        tmp = os.path.join(self._tmp_dir, f"wsi{Path(wsi_id).suffix}")
         download_with_awscli(
             self.bucket,
             os.path.join(self.root, "BRACS_WSI", wsi_id),
