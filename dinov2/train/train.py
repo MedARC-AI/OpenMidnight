@@ -71,6 +71,8 @@ class LoRALinear(nn.Module):
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         self.lora_A = nn.Linear(base.in_features, rank, bias=False)
         self.lora_B = nn.Linear(rank, base.out_features, bias=False)
+        self.lora_A.to(device=base.weight.device, dtype=base.weight.dtype)
+        self.lora_B.to(device=base.weight.device, dtype=base.weight.dtype)
         nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B.weight)
         self.base.weight.requires_grad = False
@@ -79,7 +81,12 @@ class LoRALinear(nn.Module):
 
     def forward(self, x):
         base_out = self.base(x)
-        delta = self.lora_B(self.lora_A(self.dropout(x))) * self.scaling
+        lora_input = self.dropout(x)
+        if lora_input.dtype in (torch.float16, torch.bfloat16):
+            lora_input = lora_input.float()
+        delta = self.lora_B(self.lora_A(lora_input)) * self.scaling
+        if delta.dtype != base_out.dtype:
+            delta = delta.to(base_out.dtype)
         return base_out + delta
 
     @property
@@ -115,6 +122,10 @@ class LoRAQKV(nn.Module):
         self.lora_B_q = nn.Linear(rank, qkv_dim, bias=False)
         self.lora_A_v = nn.Linear(base.in_features, rank, bias=False)
         self.lora_B_v = nn.Linear(rank, qkv_dim, bias=False)
+        self.lora_A_q.to(device=base.weight.device, dtype=base.weight.dtype)
+        self.lora_B_q.to(device=base.weight.device, dtype=base.weight.dtype)
+        self.lora_A_v.to(device=base.weight.device, dtype=base.weight.dtype)
+        self.lora_B_v.to(device=base.weight.device, dtype=base.weight.dtype)
         nn.init.kaiming_uniform_(self.lora_A_q.weight, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B_q.weight)
         nn.init.kaiming_uniform_(self.lora_A_v.weight, a=math.sqrt(5))
@@ -126,8 +137,13 @@ class LoRAQKV(nn.Module):
     def forward(self, x):
         base_out = self.base(x)
         dropped = self.dropout(x)
+        if dropped.dtype in (torch.float16, torch.bfloat16):
+            dropped = dropped.float()
         delta_q = self.lora_B_q(self.lora_A_q(dropped)) * self.scaling
         delta_v = self.lora_B_v(self.lora_A_v(dropped)) * self.scaling
+        if delta_q.dtype != base_out.dtype:
+            delta_q = delta_q.to(base_out.dtype)
+            delta_v = delta_v.to(base_out.dtype)
         q, k, v = base_out.chunk(3, dim=-1)
         q = q + delta_q
         v = v + delta_v
