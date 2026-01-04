@@ -33,7 +33,7 @@ DATA_BACKEND=${DATA_BACKEND:-s3}   # <-- Data source: s3 | local
 BRACS_ROOT=${BRACS_ROOT:-""}       # <-- Required if DATA_BACKEND=local (download data from S3 bucket)
 
 # AWS S3 settings for BRACS dataset
-AWS_ENDPOINT=${AWS_ENDPOINT} # <-- Set to your AWS S3 endpoint
+AWS_ENDPOINT=${AWS_ENDPOINT:-} # <-- Set to your AWS S3 endpoint
 AWS_PROFILE=${AWS_PROFILE:-default} # <-- Set to your AWS profile name
 AWS_BUCKET=${AWS_BUCKET:-path-datasets}
 AWS_BRACS_ROOT=${AWS_BRACS_ROOT:-bracs}
