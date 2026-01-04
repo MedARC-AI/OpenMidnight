@@ -1568,6 +1568,32 @@ def do_train(cfg, model, resume=False):
             tcga_project_id_str = str(tcga_project_id).strip()
             if tcga_project_id_str and tcga_project_id_str.lower() != "null":
                 dataset_str = f"{dataset_str}:tcga_project_id={tcga_project_id_str}"
+        def _normalize_mpp_value(value, name):
+            if value is None:
+                return None
+            if isinstance(value, str):
+                value = value.strip()
+                if not value or value.lower() == "null":
+                    return None
+            parsed = float(value)
+            if parsed <= 0:
+                raise ValueError(f"cfg.train.{name} must be > 0")
+            return parsed
+
+        mpp_min = _normalize_mpp_value(getattr(cfg.train, "MPP_min", None), "MPP_min")
+        mpp_max = _normalize_mpp_value(getattr(cfg.train, "MPP_max", None), "MPP_max")
+        if mpp_min is not None:
+            dataset_str = f"{dataset_str}:mpp_min={mpp_min}"
+        if mpp_max is not None:
+            dataset_str = f"{dataset_str}:mpp_max={mpp_max}"
+        global_crops_scale = cfg.crops.global_crops_scale
+        global_scale_min = min(global_crops_scale)
+        global_scale_max = max(global_crops_scale)
+        dataset_str = (
+            f"{dataset_str}:global_crops_size={cfg.crops.global_crops_size}"
+            f":global_crops_scale_min={global_scale_min}"
+            f":global_crops_scale_max={global_scale_max}"
+        )
         dataset = make_dataset(
             dataset_str=dataset_str,
             transform=data_transform,

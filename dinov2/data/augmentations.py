@@ -6,6 +6,7 @@
 import logging
 
 from torchvision import transforms
+from torchvision.transforms import functional as F
 
 from .transforms import (
     GaussianBlur,
@@ -119,16 +120,7 @@ class DataAugmentationDINO(object):
         logger.info(f"local_crops_size: {local_crops_size}")
         logger.info("###################################")
 
-        # random resized crop and flip
-        self.geometric_augmentation_global = transforms.Compose(
-            [
-                transforms.RandomResizedCrop(
-                    global_crops_size, scale=global_crops_scale, interpolation=transforms.InterpolationMode.BICUBIC
-                ),
-                transforms.RandomHorizontalFlip(p=0.5),
-            ]
-        )
-
+        # random resized crop and flip (local crops)
         self.geometric_augmentation_local = transforms.Compose(
             [
                 transforms.RandomResizedCrop(
@@ -183,15 +175,40 @@ class DataAugmentationDINO(object):
 
 
 
+    def _apply_global_crop(self, image, scale_range):
+        i, j, h, w = transforms.RandomResizedCrop.get_params(
+            image,
+            scale=scale_range,
+            ratio=(3.0 / 4.0, 4.0 / 3.0),
+        )
+        image = F.resized_crop(
+            image,
+            i,
+            j,
+            h,
+            w,
+            (self.global_crops_size, self.global_crops_size),
+            interpolation=transforms.InterpolationMode.BICUBIC,
+        )
+        if random.random() < 0.5:
+            image = F.hflip(image)
+        return image
+
     def __call__(self, image):
 
         output = {}
+        meta = None
+        if isinstance(image, tuple):
+            image, meta = image
+        scale_range = self.global_crops_scale
+        if meta is not None and "global_scale_range" in meta:
+            scale_range = meta["global_scale_range"]
         # global crops:
-        im1_base = self.geometric_augmentation_global(image)
+        im1_base = self._apply_global_crop(image, scale_range)
         global_crop_1 = self.global_transfo1(im1_base)
 
 
-        im2_base = self.geometric_augmentation_global(image)
+        im2_base = self._apply_global_crop(image, scale_range)
         global_crop_2 = self.global_transfo2(im2_base)
 
         output["global_crops"] = [global_crop_1, global_crop_2]

@@ -71,8 +71,10 @@ train:
    # openmidnight: 
   dataset_root: /data/TCGA
   tcga_project_id: BRCA # BRCA # set to null to disable, only works if streaming_from_hf=False
+  MPP_min: .25
+  MPP_max: 2.0
   sample_list_path: /data/TCGA/sample_dataset_30.txt # gives paths to svs files for data loading if streaming_from_hf=False
-  streaming_from_hf: true
+  streaming_from_hf: false
   streaming_dataset_path: /data/TCGA_parquet_sample30_shuffled #medarc/TCGA-12K-parquet
   batch_size_per_gpu: 48
   centering: sinkhorn_knopp
@@ -135,7 +137,7 @@ optim:
   epochs: 8000 
   early_stop: 200 # we want to early stop at 200 epochs to replicate SOTA ckpt
   weight_decay_end: 0.2
-  base_lr: 5.0e-03 # learning rate for a batch size of 1024 (swapped from 3.5e-4 to 2.0e-4)
+  base_lr: 1.0e-03 # learning rate for a batch size of 1024 (swapped from 3.5e-4 to 2.0e-4)
   warmup_epochs: 10
   layerwise_decay: 1.0
 crops:
@@ -154,15 +156,15 @@ evaluation:
   breakhis_root: /data/eva-data/breakhis
   pcam_root: /data/eva-data/patch_camelyon
 lora:
-  enabled: true
+  enabled: false
   rank: 16
   alpha: 16
   dropout: 0.0
-  target: mlp+attn # mlp+attn or attn or mlp
-  unfrozen_blocks: []
-  lora_blocks: [-2, -1]
+  target: attn # mlp+attn or attn or mlp
+  unfrozen_blocks: [-2, -1]
+  # lora_blocks: [-2, -1]
   # lora_blocks: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29] # pixio vit huge
   # lora_blocks: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45] # pixio 5b
   # lora_blocks: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47] # pixio vit5b
-  # lora_blocks: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37] # dinov2 giant
+  lora_blocks: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37] # dinov2 giant
   # lora_blocks: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37] # dinov3 vit7b
