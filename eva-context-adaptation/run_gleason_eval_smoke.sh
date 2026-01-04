@@ -11,10 +11,6 @@
 #
 # Both use the SAME patches from the same positions, ensuring fair comparison.
 #
-# NOTE: Data is not stored locally. Each time a WSI, patch image, or metadata.csv
-#       is needed, it is downloaded from the AWS S3 bucket. This means that
-#       running this script may be slower due to heavy or repeated downloads.
-#
 # Usage:
 #   ./run_gleason_eval_smoke.sh
 #
@@ -32,8 +28,12 @@ set -euo pipefail
 # Configuration
 N_SAMPLES=${N_SAMPLES:-100}
 
+# Data backend
+DATA_BACKEND=${DATA_BACKEND:-s3}    # <-- Data source: s3 | local
+GLEASON_ROOT=${GLEASON_ROOT:-""}    # <-- Required if DATA_BACKEND=local (download data from S3 bucket)
+
 # AWS S3 settings for GleasonArvaniti dataset
-AWS_ENDPOINT=${AWS_ENDPOINT} # <-- Set to your AWS S3 endpoint
+AWS_ENDPOINT=${AWS_ENDPOINT:-} # <-- Set to your AWS S3 endpoint
 AWS_PROFILE=${AWS_PROFILE:-default} # <-- Set to your AWS profile name
 AWS_BUCKET=${AWS_BUCKET:-path-datasets}
 AWS_GLEASON_ROOT=${AWS_GLEASON_ROOT:-arvaniti_gleason_patches}
@@ -72,6 +72,8 @@ echo "=============================================="
 echo "GleasonArvaniti Evaluation Smoke Test"
 echo "=============================================="
 echo "Samples per split: ${N_SAMPLES}"
+echo "Data backend:      ${DATA_BACKEND}"
+echo "Gleason root:      ${GLEASON_ROOT}"
 echo "AWS Bucket:        ${AWS_BUCKET}"
 echo "AWS Gleason Root:  ${AWS_GLEASON_ROOT}"
 echo "Baseline ckpt:     ${BASELINE_CKPT}"
@@ -101,6 +103,8 @@ else
 
     python "${EVAL_SCRIPT}" \
         --mode baseline \
+        --data-backend "${DATA_BACKEND}" \
+        --gleason-root "${GLEASON_ROOT}" \
         --baseline-checkpoint "${BASELINE_CKPT}" \
         --aws-endpoint "${AWS_ENDPOINT}" \
         --aws-profile "${AWS_PROFILE}" \
@@ -130,6 +134,8 @@ else
 
     python "${EVAL_SCRIPT}" \
         --mode context \
+        --data-backend "${DATA_BACKEND}" \
+        --gleason-root "${GLEASON_ROOT}" \
         --checkpoint "${CONTEXT_CKPT}" \
         --config "${CONTEXT_CFG}" \
         --aws-endpoint "${AWS_ENDPOINT}" \

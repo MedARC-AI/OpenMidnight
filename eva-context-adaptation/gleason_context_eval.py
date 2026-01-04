@@ -13,10 +13,7 @@ GleasonArvaniti doesn't naturally provide metadata to trace position of patches 
 the source TMA. However, we have created a CSV metadata file containing this
 information and other useful details.
 
-NOTE: Data is not stored locally. Each time a TMA image, patch image, or metadata.csv
-is needed, it is downloaded from the AWS S3 bucket. This means that training may be
-slower due to repeated downloads.
-Also to be consistent with Eva framework, only train and val splits are used
+NOTE: To be consistent with Eva framework, only train and val splits are used
 (test is not stable).
 
 For context evaluation, we:
@@ -56,8 +53,10 @@ Usage:
 import argparse
 import csv
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, List, Literal
@@ -65,9 +64,9 @@ from typing import Dict, List, Literal
 import pandas as pd
 import torch
 import torch.nn as nn
-from torchvision.transforms import v2
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
+from torchvision.transforms import v2
 from tqdm import tqdm
 
 # Setup paths
@@ -139,6 +138,80 @@ def download_with_awscli(bucket, key, dest, endpoint, profile=None):
 
     subprocess.run(cmd, check=True)
 
+class GleasonBackend:
+    def get_patch_metadata_csv(self) -> str:
+        raise NotImplementedError
+
+    def get_patch_image(self, rel_path: str) -> str:
+        raise NotImplementedError
+
+    def get_tma(self, tma_id: str) -> str:
+        raise NotImplementedError
+
+    def cleanup(self):
+        """Cleanup temporary files if needed (no-op for local backend)."""
+        pass
+
+class S3GleasonBackend(GleasonBackend):
+    def __init__(self, bucket, root, endpoint, profile):
+        self.bucket = bucket
+        self.root = root
+        self.endpoint = endpoint
+        self.profile = profile
+        self._tmp_dir = tempfile.mkdtemp(prefix="gleason_")
+
+    def get_patch_metadata_csv(self):
+        tmp = os.path.join(self._tmp_dir, "patch_metadata.csv")
+        download_with_awscli(
+            self.bucket,
+            os.path.join(self.root, "patch_metadata.csv"),
+            tmp,
+            self.endpoint,
+            self.profile,
+        )
+        return tmp
+
+    def get_patch_image(self, rel_path):
+        tmp = os.path.join(self._tmp_dir, f"patch_image{Path(rel_path).suffix}")
+        download_with_awscli(
+            self.bucket,
+            os.path.join(self.root, rel_path),
+            tmp,
+            self.endpoint,
+            self.profile,
+        )
+        return tmp
+
+    def get_tma(self, tma_id):
+        tmp = os.path.join(self._tmp_dir, f"tma{Path(tma_id).suffix}")
+        download_with_awscli(
+            self.bucket,
+            os.path.join(self.root, "tma_images", tma_id),
+            tmp,
+            self.endpoint,
+            self.profile,
+        )
+        return tmp
+
+    def cleanup(self):
+        shutil.rmtree(self._tmp_dir, ignore_errors=True)
+
+class LocalGleasonBackend(GleasonBackend):
+    def __init__(self, root):
+        self.root = Path(root)
+
+    def get_patch_metadata_csv(self):
+        return str(self.root / "patch_metadata.csv")
+
+    def get_patch_image(self, rel_path):
+        return str(self.root / rel_path)
+
+    def get_tma(self, tma_id):
+        return str(self.root / "tma_images" / tma_id)
+    
+    def cleanup(self):
+        pass
+
 class GleasonContextDataset(Dataset):
     """
     PyTorch Dataset for Gleason patch-level embedding generation in baseline or context mode.
@@ -165,10 +238,7 @@ class GleasonContextDataset(Dataset):
         self,
         split: str,
         mode: Literal["baseline", "context"],
-        aws_endpoint: str,
-        aws_gleason_root: str = "arvaniti_gleason_patches",
-        aws_bucket: str = "path-datasets",
-        aws_profile: str = None,
+        backend: GleasonBackend,
         patches_per_side: int = 16,
         model_input_size: int = 224,
         max_samples: int = None,
@@ -177,25 +247,13 @@ class GleasonContextDataset(Dataset):
 
         self.split = split
         self.mode = mode
-        self.aws_endpoint = aws_endpoint
-        self.aws_gleason_root = aws_gleason_root
-        self.aws_bucket = aws_bucket
-        self.aws_profile = aws_profile
+        self.backend = backend
         self.patches_per_side = patches_per_side
         self.model_input_size = model_input_size
 
-        # Download patch metadata CSV
-        tmp_csv_path = "/tmp/patch_metadata.csv"
-        download_with_awscli(
-            self.aws_bucket,
-            os.path.join(self.aws_gleason_root, "patch_metadata.csv"),
-            tmp_csv_path,
-            self.aws_endpoint,
-            self.aws_profile,
-        )
-
         # Load metadata and filter by split
-        self.meta_df = pd.read_csv(tmp_csv_path)
+        csv_path = self.backend.get_patch_metadata_csv()
+        self.meta_df = pd.read_csv(csv_path)
         self.meta_df = self.meta_df[self.meta_df["split"] == split].reset_index(drop=True)
 
         if max_samples is not None:
@@ -212,10 +270,6 @@ class GleasonContextDataset(Dataset):
                             std=[0.229, 0.224, 0.225]),
         ])
 
-        # Clean up
-        if os.path.exists(tmp_csv_path):
-            os.remove(tmp_csv_path)
-    
     def __len__(self) -> int:
         return len(self.meta_df)
     
@@ -223,25 +277,11 @@ class GleasonContextDataset(Dataset):
         row = self.meta_df.iloc[idx]
 
         label = int(row["label"])
-        patch_name = row["patch_name"]
 
         if self.mode == "baseline":
-            # Download patch image
-            tmp_patch = f"/tmp/{patch_name}.jpg"
-
-            download_with_awscli(
-                self.aws_bucket,
-                os.path.join(self.aws_gleason_root, row["patch_fullpath"]),
-                tmp_patch,
-                self.aws_endpoint,
-                self.aws_profile,
-            )
-
-            img = Image.open(tmp_patch).convert("RGB")
+            img_path = self.backend.get_patch_image(row["patch_fullpath"])
+            img = Image.open(img_path).convert("RGB")
             patch_tensor = self.transform(img)
-
-            if os.path.exists(tmp_patch):
-                os.remove(tmp_patch)
 
             return patch_tensor, label, idx
 
@@ -251,21 +291,10 @@ class GleasonContextDataset(Dataset):
             cx = float(row["centroid_x"])
             cy = float(row["centroid_y"])
 
-            # --- download TMA ---
+            # Load TMA
             tma_id = self.get_tma_id(idx) + ".jpg"
-            tmp_tma = f"/tmp/{tma_id}"
-
-            # If already exists (from previous sample), reuse
-            download_with_awscli(
-                self.aws_bucket,
-                os.path.join(self.aws_gleason_root, "tma_images", tma_id),
-                tmp_tma,
-                self.aws_endpoint,
-                self.aws_profile,
-            )
-
-            # Load TMA image
-            tma = Image.open(tmp_tma).convert("RGB")
+            tma_path = self.backend.get_tma(tma_id)
+            tma = Image.open(tma_path).convert("RGB")
             orig_w, orig_h = tma.size
 
             region_size = self.patches_per_side * self.model_input_size
@@ -321,10 +350,6 @@ class GleasonContextDataset(Dataset):
             ]
 
             region_tensor = torch.stack(tiles, dim=0)
-
-            # Clean up
-            if os.path.exists(tmp_tma):
-                os.remove(tmp_tma)
 
             return region_tensor, target_index, label, idx
     
@@ -533,12 +558,20 @@ def main():
                         help="Path to context adapter config YAML (for context mode)")
 
     # Data paths
+    parser.add_argument("--data-backend", choices=["s3", "local"], default="s3",
+                        help="Where GleasonArvaniti data is stored")
+
+    # S3 params
     parser.add_argument("--aws-bucket", default="path-datasets",
                         help="AWS S3 cloudfare bucket for downstream datasets")
     parser.add_argument("--aws-gleason-root", default="arvaniti_gleason_patches",
                         help="Path to GleasonArvaniti data in the bucket")
     parser.add_argument("--output-root", required=True,
                         help="Output directory for embeddings")
+    
+    # Local
+    parser.add_argument("--gleason-root",
+                        help="Local GleasonArvaniti root (required if data-backend=local)")
 
     # Processing options
     parser.add_argument("--splits", nargs="+", default=["train", "val"],
@@ -561,6 +594,9 @@ def main():
     parser.add_argument("--skip-eva-fit", action="store_true")
 
     args = parser.parse_args()
+
+    if args.data_backend == "local" and not args.gleason_root:
+        parser.error("--gleason-root is required when using local backend")
 
     if args.aws_profile in [None, "default", ""]:
         aws_profile = None
@@ -586,6 +622,17 @@ def main():
 
     print(f"Embedding dimension: {embed_dim}")
 
+    # Setup data backend
+    if args.data_backend == "s3":
+        backend = S3GleasonBackend(
+            bucket=args.aws_bucket,
+            root=args.aws_gleason_root,
+            endpoint=args.aws_endpoint,
+            profile=aws_profile,
+        )
+    else:
+        backend = LocalGleasonBackend(args.gleason_root)
+
     # Generate embeddings for each split
     output_root = Path(args.output_root)
     all_records = []
@@ -596,10 +643,7 @@ def main():
         dataset = GleasonContextDataset(
             split=split,
             mode=args.mode,
-            aws_endpoint=args.aws_endpoint,
-            aws_gleason_root=args.aws_gleason_root,
-            aws_bucket=args.aws_bucket,
-            aws_profile=aws_profile,
+            backend=backend,
             max_samples=args.max_samples,
         )
 
@@ -622,6 +666,9 @@ def main():
         all_records.extend(records)
 
         print(f"  Generated {len(records)} embeddings")
+    
+    # Cleanup backend temporary files if needed
+    backend.cleanup()
 
     # Write manifest
     manifest_path = output_root / "manifest.csv"
@@ -632,7 +679,6 @@ def main():
     target_root = output_root / args.model_name / "gleason"
     target_root.mkdir(parents=True, exist_ok=True)
 
-    import shutil
     shutil.copy(manifest_path, target_root / "manifest.csv")
 
     emb_src = output_root / "embeddings"

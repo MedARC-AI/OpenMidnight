@@ -11,10 +11,6 @@ BRACS doesn't naturally provide metadata to trace position of patches within
 the source WSI. However, we have created a CSV metadata file containing this
 information and other useful details.
 
-NOTE: Data is not stored locally. Each time a WSI, patch image, or metadata.csv
-is needed, it is downloaded from the AWS S3 bucket. This means that
-that training may be slower due to heavy or repeated downloads.
-
 For context evaluation, we:
 1. Retrieve the patch metadata (centroid coordinates and WSI ID) from the CSV
 2. Download the corresponding WSI from S3
@@ -52,8 +48,10 @@ Usage:
 import argparse
 import csv
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, List, Literal
@@ -61,9 +59,9 @@ from typing import Dict, List, Literal
 import pandas as pd
 import torch
 import torch.nn as nn
-from torchvision.transforms import v2
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
+from torchvision.transforms import v2
 from tqdm import tqdm
 
 # Setup paths
@@ -142,6 +140,80 @@ def download_with_awscli(bucket, key, dest, endpoint, profile=None):
 
     subprocess.run(cmd, check=True)
 
+class BRACSBackend:
+    def get_patch_metadata_csv(self) -> str:
+        raise NotImplementedError
+
+    def get_patch_image(self, rel_path: str) -> str:
+        raise NotImplementedError
+
+    def get_wsi(self, wsi_id: str) -> str:
+        raise NotImplementedError
+
+    def cleanup(self):
+        """Cleanup temporary files if needed (no-op for local backend)."""
+        pass
+
+class S3BRACSBackend(BRACSBackend):
+    def __init__(self, bucket, root, endpoint, profile):
+        self.bucket = bucket
+        self.root = root
+        self.endpoint = endpoint
+        self.profile = profile
+        self._tmp_dir = tempfile.mkdtemp(prefix="bracs_")
+
+    def get_patch_metadata_csv(self):
+        tmp = os.path.join(self._tmp_dir, "patch_metadata.csv")
+        download_with_awscli(
+            self.bucket,
+            os.path.join(self.root, "patch_metadata.csv"),
+            tmp,
+            self.endpoint,
+            self.profile,
+        )
+        return tmp
+
+    def get_patch_image(self, rel_path):
+        tmp = os.path.join(self._tmp_dir, f"patch_image{Path(rel_path).suffix}")
+        download_with_awscli(
+            self.bucket,
+            os.path.join(self.root, rel_path),
+            tmp,
+            self.endpoint,
+            self.profile,
+        )
+        return tmp
+
+    def get_wsi(self, wsi_id):
+        tmp = os.path.join(self._tmp_dir, f"wsi{Path(wsi_id).suffix}")
+        download_with_awscli(
+            self.bucket,
+            os.path.join(self.root, "BRACS_WSI", wsi_id),
+            tmp,
+            self.endpoint,
+            self.profile,
+        )
+        return tmp
+
+    def cleanup(self):
+        shutil.rmtree(self._tmp_dir, ignore_errors=True)
+
+class LocalBRACSBackend(BRACSBackend):
+    def __init__(self, root):
+        self.root = Path(root)
+
+    def get_patch_metadata_csv(self):
+        return str(self.root / "patch_metadata.csv")
+
+    def get_patch_image(self, rel_path):
+        return str(self.root / rel_path)
+
+    def get_wsi(self, wsi_id):
+        return str(self.root / "BRACS_WSI" / wsi_id)
+    
+    def cleanup(self):
+        pass
+
 class BRACSContextDataset(Dataset):
     """
     PyTorch Dataset for BRACS patch-level embedding generation in baseline or context mode.
@@ -168,10 +240,7 @@ class BRACSContextDataset(Dataset):
         self,
         split: str,
         mode: Literal["baseline", "context"],
-        aws_endpoint: str,
-        aws_bracs_root: str = "bracs",
-        aws_bucket: str = "path-datasets",
-        aws_profile: str = None,
+        backend: BRACSBackend,
         patches_per_side: int = 16,
         model_input_size: int = 224,
         max_samples: int = None,
@@ -180,26 +249,13 @@ class BRACSContextDataset(Dataset):
 
         self.split = split
         self.mode = mode
-        self.aws_endpoint = aws_endpoint
-        self.aws_bracs_root = aws_bracs_root
-        self.aws_bucket = aws_bucket
-        self.aws_profile = aws_profile
+        self.backend = backend
         self.patches_per_side = patches_per_side
         self.model_input_size = model_input_size
-        self.previous_wsi = ""  # Track previously downloaded WSI
-
-        # Download patch metadata CSV
-        tmp_csv_path = "/tmp/patch_metadata.csv"
-        download_with_awscli(
-            self.aws_bucket,
-            os.path.join(self.aws_bracs_root, "patch_metadata.csv"),
-            tmp_csv_path,
-            self.aws_endpoint,
-            self.aws_profile,
-        )
 
         # Load metadata and filter by split
-        self.meta_df = pd.read_csv(tmp_csv_path)
+        csv_path = self.backend.get_patch_metadata_csv()
+        self.meta_df = pd.read_csv(csv_path)
         self.meta_df = self.meta_df[self.meta_df["split"] == split].reset_index(drop=True)
 
         if max_samples is not None:
@@ -215,10 +271,6 @@ class BRACSContextDataset(Dataset):
             v2.Normalize(mean=[0.485, 0.456, 0.406],
                             std=[0.229, 0.224, 0.225]),
         ])
-
-        # Clean up
-        if os.path.exists(tmp_csv_path):
-            os.remove(tmp_csv_path)
     
     def __len__(self) -> int:
         return len(self.meta_df)
@@ -230,22 +282,10 @@ class BRACSContextDataset(Dataset):
         patch_name = row["patch_name"]
 
         if self.mode == "baseline":
-            # Download patch image
-            tmp_patch = f"/tmp/{patch_name}.png"
-
-            download_with_awscli(
-                self.aws_bucket,
-                os.path.join(self.aws_bracs_root, row["patch_fullpath"]),
-                tmp_patch,
-                self.aws_endpoint,
-                self.aws_profile,
-            )
-
-            img = Image.open(tmp_patch).convert("RGB")
+            # Load patch image
+            img_path = self.backend.get_patch_image(row["patch_fullpath"])
+            img = Image.open(img_path).convert("RGB")
             patch_tensor = self.transform(img)
-
-            if os.path.exists(tmp_patch):
-                os.remove(tmp_patch)
 
             return patch_tensor, label, idx
 
@@ -257,24 +297,8 @@ class BRACSContextDataset(Dataset):
 
             # --- download WSI ---
             wsi_id = "_".join(patch_name.split("_")[:2]) + ".svs"
-            tmp_wsi = f"/tmp/{wsi_id}"
-
-            # If already exists (from previous sample), reuse
-            if tmp_wsi == self.previous_wsi:
-                slide = openslide.OpenSlide(tmp_wsi)
-            else:
-                if os.path.exists(self.previous_wsi):
-                    os.remove(self.previous_wsi)
-
-                download_with_awscli(
-                    self.aws_bucket,
-                    os.path.join(self.aws_bracs_root, "BRACS_WSI", wsi_id),
-                    tmp_wsi,
-                    self.aws_endpoint,
-                    self.aws_profile,
-                )
-
-                slide = openslide.OpenSlide(tmp_wsi)
+            wsi_path = self.backend.get_wsi(wsi_id)
+            slide = openslide.OpenSlide(wsi_path)
 
             w, h = slide.dimensions
             region_size = self.patches_per_side * self.model_input_size
@@ -325,7 +349,6 @@ class BRACSContextDataset(Dataset):
             region_tensor = torch.stack(tiles, dim=0)
 
             slide.close()
-            self.previous_wsi = tmp_wsi
 
             return region_tensor, target_index, label, idx
     
@@ -534,12 +557,20 @@ def main():
                         help="Path to context adapter config YAML (for context mode)")
 
     # Data paths
+    parser.add_argument("--data-backend", choices=["s3", "local"], default="s3",
+                        help="Where BRACS data is stored")
+
+    # S3 params
     parser.add_argument("--aws-bucket", default="path-datasets",
                         help="AWS S3 cloudfare bucket for downstream datasets")
     parser.add_argument("--aws-bracs-root", default="bracs",
                         help="Path to BRACS data (BRACS_WSI, BRACS_RoI, patch_metadata.csv) in the bucket")
     parser.add_argument("--output-root", required=True,
                         help="Output directory for embeddings")
+    
+    # Local
+    parser.add_argument("--bracs-root",
+                        help="Local BRACS root (required if data-backend=local)")
 
     # Processing options
     parser.add_argument("--splits", nargs="+", default=["train", "val", "test"],
@@ -562,6 +593,9 @@ def main():
     parser.add_argument("--skip-eva-fit", action="store_true")
 
     args = parser.parse_args()
+
+    if args.data_backend == "local" and not args.bracs_root:
+        parser.error("--bracs-root is required when using local backend")
 
     if args.aws_profile in [None, "default", ""]:
         aws_profile = None
@@ -587,6 +621,17 @@ def main():
 
     print(f"Embedding dimension: {embed_dim}")
 
+    # Setup data backend
+    if args.data_backend == "s3":
+        backend = S3BRACSBackend(
+            bucket=args.aws_bucket,
+            root=args.aws_bracs_root,
+            endpoint=args.aws_endpoint,
+            profile=aws_profile,
+        )
+    else:
+        backend = LocalBRACSBackend(args.bracs_root)
+
     # Generate embeddings for each split
     output_root = Path(args.output_root)
     all_records = []
@@ -597,10 +642,7 @@ def main():
         dataset = BRACSContextDataset(
             split=split,
             mode=args.mode,
-            aws_endpoint=args.aws_endpoint,
-            aws_bracs_root=args.aws_bracs_root,
-            aws_bucket=args.aws_bucket,
-            aws_profile=aws_profile,
+            backend=backend,
             max_samples=args.max_samples,
         )
 
@@ -623,6 +665,9 @@ def main():
         all_records.extend(records)
 
         print(f"  Generated {len(records)} embeddings")
+    
+    # Cleanup backend temporary files if needed
+    backend.cleanup()
 
     # Write manifest
     manifest_path = output_root / "manifest.csv"
@@ -633,7 +678,6 @@ def main():
     target_root = output_root / args.model_name / "bracs"
     target_root.mkdir(parents=True, exist_ok=True)
 
-    import shutil
     shutil.copy(manifest_path, target_root / "manifest.csv")
 
     emb_src = output_root / "embeddings"
