@@ -1,0 +1,62 @@
+# Perceiver Contrastive Training Configuration
+# Multi-target contrastive learning for Perceiver-based context adaptation
+# K=8 targets per region, InfoNCE loss (same region = positive)
+
+data:
+  tcga_root: /data/TCGA
+  sample_list: /data/TCGA/sample_dataset_30.txt
+  region_size: 3584  # 16x16 grid of 224x224 patches
+  patch_size: 224
+  patches_per_side: 16  # 3584 / 224 = 16
+  num_patches_per_region: 256  # 16 * 16
+
+patch_vit:
+  checkpoint: /data/dinov2_ckpt_for_blog/openmidnight_checkpoint.pth
+  arch: vit_giant2
+  patch_size: 14  # ViT internal patch size (14x14 patches)
+  embed_dim: 1536  # ViT-G/14 embedding dimension
+  num_register_tokens: 4
+  block_chunks: 4
+  ffn_layer: swiglu
+  init_values: 1.0
+  freeze: true  # Keep OpenMidnight frozen
+
+perceiver:
+  dim: 768  # Working dimension (downproject from 1536)
+  num_latents: 64  # Compress 65,536 tokens → 64 latents
+  num_layers: 6  # Perceiver transformer depth
+  num_heads: 12  # Attention heads
+  dim_head: 64  # Dimension per head (768 / 12 = 64)
+
+cross_attention:
+  depth: 4  # Number of cross-attention blocks
+  num_heads: 12  # Attention heads
+
+contrastive:
+  num_targets: 8  # K targets sampled per region
+  projection_dim: 256  # Output dimension after contrastive projection
+
+train:
+  batch_size_per_gpu: 8
+  num_workers: 4
+  max_iters: 10000  # Training iterations
+  output_dir: /home/rohit/OpenMidnight/outputs_perceiver/contrastive_xp1
+
+optim:
+  base_lr: 5.0e-5
+  min_lr: 1.0e-6
+  weight_decay: 0.05
+  adamw_beta1: 0.9
+  adamw_beta2: 0.999
+  clip_grad: 3.0
+
+loss:
+  contrastive_weight: 1.0
+  contrastive_temperature: 0.1  # InfoNCE temperature
+
+evaluation:
+  save_period_iters: 500  # Save checkpoint every N iterations
+
+wandb:
+  project: openmidnight-perceiver
+  entity: null  # Use default
