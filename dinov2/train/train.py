@@ -21,11 +21,12 @@ import torch
 import torch.nn as nn
 
 from dinov2.data import collate_data_and_cast, DataAugmentationDINO, MaskingGenerator
+from dinov2.data.transforms import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 import dinov2.distributed as distributed
 from dinov2.fsdp import FSDPCheckpointer
 from dinov2.logging import MetricLogger
 from dinov2.utils.config import setup
-from dinov2.utils.utils import CosineScheduler
+from dinov2.utils.utils import CosineScheduler, LinearScheduler
 
 from dinov2.train.ssl_meta_arch import SSLMetaArch, LeJEPAMetaArch
 from dinov2.train.jepa_logging import JEPALogger
@@ -59,6 +60,8 @@ import wandb
 
 RUN_SCRIPT = os.environ.get("DINOV2_RUN_SCRIPT", "")
 AUGMENTATION_FILE = Path(__file__).resolve().parents[1] / "data" / "augmentations.py"
+VISION_TRANSFORMER_FILE = Path(__file__).resolve().parents[1] / "models" / "vision_transformer.py"
+SSL_META_ARCH = Path(__file__).resolve().parents[1] / "train" / "ssl_meta_arch.py"
 
 class LoRALinear(nn.Module):
     def __init__(self, base, rank, alpha, dropout):
@@ -71,8 +74,6 @@ class LoRALinear(nn.Module):
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         self.lora_A = nn.Linear(base.in_features, rank, bias=False)
         self.lora_B = nn.Linear(rank, base.out_features, bias=False)
-        self.lora_A.to(device=base.weight.device, dtype=base.weight.dtype)
-        self.lora_B.to(device=base.weight.device, dtype=base.weight.dtype)
         nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B.weight)
         self.base.weight.requires_grad = False
@@ -81,12 +82,7 @@ class LoRALinear(nn.Module):
 
     def forward(self, x):
         base_out = self.base(x)
-        lora_input = self.dropout(x)
-        if lora_input.dtype in (torch.float16, torch.bfloat16):
-            lora_input = lora_input.float()
-        delta = self.lora_B(self.lora_A(lora_input)) * self.scaling
-        if delta.dtype != base_out.dtype:
-            delta = delta.to(base_out.dtype)
+        delta = self.lora_B(self.lora_A(self.dropout(x))) * self.scaling
         return base_out + delta
 
     @property
@@ -122,10 +118,6 @@ class LoRAQKV(nn.Module):
         self.lora_B_q = nn.Linear(rank, qkv_dim, bias=False)
         self.lora_A_v = nn.Linear(base.in_features, rank, bias=False)
         self.lora_B_v = nn.Linear(rank, qkv_dim, bias=False)
-        self.lora_A_q.to(device=base.weight.device, dtype=base.weight.dtype)
-        self.lora_B_q.to(device=base.weight.device, dtype=base.weight.dtype)
-        self.lora_A_v.to(device=base.weight.device, dtype=base.weight.dtype)
-        self.lora_B_v.to(device=base.weight.device, dtype=base.weight.dtype)
         nn.init.kaiming_uniform_(self.lora_A_q.weight, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B_q.weight)
         nn.init.kaiming_uniform_(self.lora_A_v.weight, a=math.sqrt(5))
@@ -137,13 +129,8 @@ class LoRAQKV(nn.Module):
     def forward(self, x):
         base_out = self.base(x)
         dropped = self.dropout(x)
-        if dropped.dtype in (torch.float16, torch.bfloat16):
-            dropped = dropped.float()
         delta_q = self.lora_B_q(self.lora_A_q(dropped)) * self.scaling
         delta_v = self.lora_B_v(self.lora_A_v(dropped)) * self.scaling
-        if delta_q.dtype != base_out.dtype:
-            delta_q = delta_q.to(base_out.dtype)
-            delta_v = delta_v.to(base_out.dtype)
         q, k, v = base_out.chunk(3, dim=-1)
         q = q + delta_q
         v = v + delta_v
@@ -193,19 +180,76 @@ def _normalize_block_indices(indices, num_blocks, name):
     return resolved
 
 
+def _set_grad_block_start(backbone, grad_block_start):
+    if grad_block_start is None:
+        return
+    if backbone.chunked_blocks:
+        for chunk in backbone.blocks:
+            chunk.grad_block_start = grad_block_start
+    backbone.grad_block_start = grad_block_start
+
+
+def _compute_grad_norm(model):
+    total = torch.zeros((), device=next(model.parameters()).device, dtype=torch.float32)
+    for param in model.parameters():
+        if not param.requires_grad:
+            continue
+        if param.grad is None:
+            continue
+        total += param.grad.detach().float().pow(2).sum()
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(total, op=dist.ReduceOp.SUM)
+    return float(total.sqrt())
+
+
+def _clip_grad_norm_for_student(student, max_norm):
+    total_sq = 0.0
+    for v in student.values():
+        module_norm = float(v.clip_grad_norm_(max_norm))
+        total_sq += module_norm * module_norm
+    return math.sqrt(total_sq)
+
+
+def _to_wandb_image(tensor, caption):
+    tensor = tensor.detach().float().cpu()
+    mean = torch.tensor(IMAGENET_DEFAULT_MEAN).view(3, 1, 1)
+    std = torch.tensor(IMAGENET_DEFAULT_STD).view(3, 1, 1)
+    tensor = (tensor * std + mean).clamp(0, 1)
+    image = tensor.permute(1, 2, 0).numpy()
+    return wandb.Image(image, caption=caption)
+
+
+def _log_crops_to_wandb(data, step):
+    batch_size = len(data["indexes"])
+    if batch_size == 0:
+        return
+    global_crops = data["collated_global_crops"]
+    local_crops = data["collated_local_crops"]
+    n_global_crops = global_crops.shape[0] // batch_size
+    n_local_crops = local_crops.shape[0] // batch_size if local_crops.numel() > 0 else 0
+    global_images = [
+        _to_wandb_image(global_crops[i * batch_size], f"global_{i}")
+        for i in range(n_global_crops)
+    ]
+    local_images = [
+        _to_wandb_image(local_crops[i * batch_size], f"local_{i}")
+        for i in range(n_local_crops)
+    ]
+    wandb.log(
+        {
+            "debug/global_crops": global_images,
+            "debug/local_crops": local_images,
+        },
+        step=step,
+    )
+
+
 def _unfreeze_layer_norms_in_blocks(blocks, block_indices):
     for idx in block_indices:
         for submodule in blocks[idx].modules():
             if isinstance(submodule, nn.LayerNorm):
                 for param in submodule.parameters():
                     param.requires_grad = True
-
-
-def _set_grad_block_start(backbone, grad_block_start):
-    backbone.grad_block_start = grad_block_start
-    if getattr(backbone, "chunked_blocks", False):
-        for chunk in backbone.blocks:
-            chunk.grad_block_start = grad_block_start
 
 
 def _apply_lora_to_mlp(mlp, rank, alpha, dropout):
@@ -233,17 +277,18 @@ def _apply_lora_to_attn(attn, rank, alpha, dropout):
 
 
 def _apply_lora_to_backbone(cfg, backbone):
-    rank = cfg.lora.rank
-    alpha = cfg.lora.alpha
-    dropout = cfg.lora.dropout
-    target = cfg.lora.target
+    peft_cfg = cfg.peft
+    rank = peft_cfg.rank
+    alpha = peft_cfg.alpha
+    dropout = peft_cfg.dropout
+    target = peft_cfg.target
     if rank <= 0:
-        raise ValueError("cfg.lora.rank must be > 0")
+        raise ValueError("cfg.peft.rank must be > 0")
     if target not in ("mlp", "attn", "mlp+attn"):
-        raise ValueError("cfg.lora.target must be one of: mlp, attn, mlp+attn")
+        raise ValueError("cfg.peft.target must be one of: mlp, attn, mlp+attn")
 
     blocks = _get_vit_blocks(backbone)
-    lora_blocks = _normalize_block_indices(cfg.lora.lora_blocks, len(blocks), "cfg.lora.lora_blocks")
+    lora_blocks = _normalize_block_indices(peft_cfg.lora_blocks, len(blocks), "cfg.peft.lora_blocks")
     use_mlp = target in ("mlp", "mlp+attn")
     use_attn = target in ("attn", "mlp+attn")
     replaced_mlp = 0
@@ -261,8 +306,8 @@ def _apply_lora_to_backbone(cfg, backbone):
     return replaced_mlp, replaced_attn
 
 
-def _enable_lora(cfg, model):
-    if not cfg.lora.enabled:
+def _enable_peft(cfg, model):
+    if not cfg.peft.enabled:
         return 0, 0
 
     if hasattr(model, "teacher"):
@@ -275,8 +320,9 @@ def _enable_lora(cfg, model):
         raise ValueError("LoRA injection expects model with teacher or backbone")
     blocks = _get_vit_blocks(student_backbone)
     num_blocks = len(blocks)
-    unfrozen_blocks = _normalize_block_indices(cfg.lora.unfrozen_blocks, num_blocks, "cfg.lora.unfrozen_blocks")
-    lora_blocks = _normalize_block_indices(cfg.lora.lora_blocks, num_blocks, "cfg.lora.lora_blocks")
+    peft_cfg = cfg.peft
+    unfrozen_blocks = _normalize_block_indices(peft_cfg.unfrozen_blocks, num_blocks, "cfg.peft.unfrozen_blocks")
+    lora_blocks = _normalize_block_indices(peft_cfg.lora_blocks, num_blocks, "cfg.peft.lora_blocks")
     overlap = set(unfrozen_blocks) & set(lora_blocks)
     if overlap:
         raise ValueError(f"Blocks cannot be both unfrozen and LoRA-tunable: {sorted(overlap)}")
@@ -290,10 +336,10 @@ def _enable_lora(cfg, model):
 
     trainable_blocks = sorted(set(unfrozen_blocks) | set(lora_blocks))
     _unfreeze_layer_norms_in_blocks(blocks, trainable_blocks)
+    grad_block_start = trainable_blocks[0] if trainable_blocks else num_blocks
+    _set_grad_block_start(student_backbone, grad_block_start)
 
     replaced_mlp, replaced_attn = _apply_lora_to_backbone(cfg, student_backbone)
-    grad_block_start = min(trainable_blocks) if trainable_blocks else num_blocks
-    _set_grad_block_start(student_backbone, grad_block_start)
 
     if teacher_backbone is not None:
         teacher_blocks = _get_vit_blocks(teacher_backbone)
@@ -302,7 +348,6 @@ def _enable_lora(cfg, model):
         _apply_lora_to_backbone(cfg, teacher_backbone)
         for param in teacher_backbone.parameters():
             param.requires_grad = False
-        _set_grad_block_start(teacher_backbone, grad_block_start)
 
     return replaced_mlp, replaced_attn
 
@@ -404,11 +449,21 @@ For python-based LazyConfig, use "path.key=value".
 
 
 def build_optimizer(cfg, params_groups):
-    return torch.optim.AdamW(params_groups, betas=(cfg.optim.adamw_beta1, cfg.optim.adamw_beta2))
+    if cfg.optim.optimizer == "AdamW":
+        return torch.optim.AdamW(params_groups, betas=(cfg.optim.adamw_beta1, cfg.optim.adamw_beta2))
+    if cfg.optim.optimizer == "Muon":
+        return torch.optim.Muon(params_groups)
+    raise ValueError("cfg.optim.optimizer must be AdamW or Muon")
 
 
 def build_schedulers(cfg, objective):
     OFFICIAL_EPOCH_LENGTH = cfg.train.OFFICIAL_EPOCH_LENGTH
+    if cfg.optim.lr_schedule == "CosineScheduler":
+        lr_scheduler = CosineScheduler
+    elif cfg.optim.lr_schedule == "LinearLR":
+        lr_scheduler = LinearScheduler
+    else:
+        raise ValueError("cfg.optim.lr_schedule must be CosineScheduler or LinearLR")
     lr = dict(
         base_value=cfg.optim["lr"],
         final_value=cfg.optim["min_lr"],
@@ -422,7 +477,7 @@ def build_schedulers(cfg, objective):
         total_iters=cfg.optim["epochs"] * OFFICIAL_EPOCH_LENGTH,
     )
 
-    lr_schedule = CosineScheduler(**lr)
+    lr_schedule = lr_scheduler(**lr)
     wd_schedule = CosineScheduler(**wd)
     momentum_schedule = None
     teacher_temp_schedule = None
@@ -441,7 +496,7 @@ def build_schedulers(cfg, objective):
         )
         momentum_schedule = CosineScheduler(**momentum)
         teacher_temp_schedule = CosineScheduler(**teacher_temp)
-    last_layer_lr_schedule = CosineScheduler(**lr)
+    last_layer_lr_schedule = lr_scheduler(**lr)
 
     last_layer_lr_schedule.schedule[
         : cfg.optim["freeze_last_layer_epochs"] * OFFICIAL_EPOCH_LENGTH
@@ -466,26 +521,6 @@ def apply_optim_scheduler(optimizer, lr, wd, last_layer_lr):
         param_group["weight_decay"] = wd * wd_multiplier
         param_group["lr"] = (last_layer_lr if is_last_layer else lr) * lr_multiplier
 
-
-def _iter_vit_blocks(backbone):
-    if backbone.chunked_blocks:
-        for chunk in backbone.blocks:
-            for blk in chunk:
-                if not isinstance(blk, torch.nn.Identity):
-                    yield blk
-    else:
-        for blk in backbone.blocks:
-            yield blk
-
-
-def _mlp_kind(block):
-    if hasattr(block.mlp, "fc1"):
-        return "mlp"
-    if hasattr(block.mlp, "w12"):
-        return "swiglu"
-    raise AssertionError("Unsupported FFN block type")
-
-
 _FULL_STATE_DICT_CFG = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
 
 _HUB_ARCH_NAMES = {
@@ -508,152 +543,23 @@ def _resolve_torchhub_name(cfg):
     return f"dinov2_{hub_arch}{cfg.student.patch_size}{reg_suffix}"
 
 
-def _load_pixio_pretrained_backbone(cfg, model):
-    ckpt_path = cfg.train.pretrained_ckpt
-    logger.info("Loading pixio pretrained backbone from: %s", ckpt_path)
-    state_dict = torch.load(ckpt_path, map_location="cpu")
-
-    if hasattr(model, "teacher"):
-        student_backbone = model.student.backbone
-    elif hasattr(model, "backbone"):
-        student_backbone = model.backbone
-    else:
-        raise ValueError("Pretrained load expects model with teacher or backbone")
-
-    device = next(model.parameters()).device
-    pixio_cls = state_dict["cls_token"].to(device)
-    pixio_pos = state_dict["pos_embed"].to(device)
-
-    num_prefix_tokens = pixio_cls.shape[1]
-    if pixio_pos.shape[1] <= num_prefix_tokens:
-        raise AssertionError("Pixio pos_embed does not contain patch tokens")
-    if student_backbone.embed_dim != pixio_cls.shape[-1]:
-        raise AssertionError("Pixio embed_dim mismatch")
-    if student_backbone.num_register_tokens != num_prefix_tokens - 1:
-        raise AssertionError(
-            "Pixio expects num_register_tokens == cls_tokens - 1 "
-            f"(got {student_backbone.num_register_tokens}, cls_tokens={num_prefix_tokens})"
-        )
-
-    patch_weight = state_dict["patch_embed.proj.weight"].to(device)
-    patch_bias = state_dict["patch_embed.proj.bias"].to(device)
-    if student_backbone.patch_embed.proj.weight.shape != patch_weight.shape:
-        raise AssertionError("Pixio patch_embed weight shape mismatch")
-    if student_backbone.patch_embed.proj.bias.shape != patch_bias.shape:
-        raise AssertionError("Pixio patch_embed bias shape mismatch")
-
-    with torch.no_grad():
-        student_backbone.patch_embed.proj.weight.copy_(patch_weight)
-        student_backbone.patch_embed.proj.bias.copy_(patch_bias)
-        student_backbone.cls_token.copy_(pixio_cls[:, :1, :])
-        if student_backbone.num_register_tokens:
-            reg_tokens = pixio_cls[:, 1 : 1 + student_backbone.num_register_tokens, :]
-            reg_pos = pixio_pos[:, 1 : 1 + student_backbone.num_register_tokens, :]
-            student_backbone.register_tokens.copy_(reg_tokens + reg_pos)
-
-        cls_pos = pixio_pos[:, :1, :]
-        patch_pos = pixio_pos[:, num_prefix_tokens:, :]
-        orig_size = int(patch_pos.shape[1] ** 0.5)
-        if orig_size * orig_size != patch_pos.shape[1]:
-            raise AssertionError("Pixio patch pos_embed is not square")
-        patch_pos = patch_pos.reshape(1, orig_size, orig_size, -1).permute(0, 3, 1, 2)
-
-        target_h, target_w = student_backbone.patch_embed.patches_resolution
-        resized_patch_pos = F.interpolate(
-            patch_pos,
-            size=(target_h, target_w),
-            mode="bicubic",
-            align_corners=False,
-            antialias=student_backbone.interpolate_antialias,
-        )
-        resized_patch_pos = resized_patch_pos.permute(0, 2, 3, 1).reshape(1, target_h * target_w, -1)
-        student_backbone.pos_embed.copy_(torch.cat((cls_pos, resized_patch_pos), dim=1))
-
-        student_blocks = list(_iter_vit_blocks(student_backbone))
-        pixio_block_indices = sorted({int(k.split(".")[1]) for k in state_dict if k.startswith("blocks.")})
-        if pixio_block_indices != list(range(len(student_blocks))):
-            raise AssertionError("Pixio block indices are not contiguous")
-        if len(student_blocks) != len(pixio_block_indices):
-            raise AssertionError("Pixio depth mismatch")
-        if student_blocks and _mlp_kind(student_blocks[0]) != "mlp":
-            raise AssertionError("Pixio checkpoint expects mlp FFN blocks")
-        for idx, dst in enumerate(student_blocks):
-            prefix = f"blocks.{idx}."
-            block_state = {k[len(prefix) :]: v.to(device) for k, v in state_dict.items() if k.startswith(prefix)}
-            if not block_state:
-                raise AssertionError(f"Missing pixio block {idx} in checkpoint")
-            dst.load_state_dict(block_state, strict=True)
-
-        student_backbone.norm.weight.copy_(state_dict["norm.weight"].to(device))
-        student_backbone.norm.bias.copy_(state_dict["norm.bias"].to(device))
-
-def _load_dinov2_pretrained_backbone(cfg, model):
-    ckpt_path = cfg.train.pretrained_ckpt
-    logger.info("Loading dinov2 pretrained backbone from: %s", ckpt_path)
-    state_dict = torch.load(ckpt_path, map_location="cpu")
-    if "teacher" in state_dict:
-        state_dict = state_dict["teacher"]
-    elif "backbone" in state_dict:
-        state_dict = state_dict["backbone"]
-    elif "model" in state_dict:
-        state_dict = state_dict["model"]
-
-    state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
-    if any(k.startswith("teacher.") for k in state_dict):
-        state_dict = {k.replace("teacher.", ""): v for k, v in state_dict.items() if k.startswith("teacher.")}
-    elif any(k.startswith("student.") for k in state_dict):
-        state_dict = {k.replace("student.", ""): v for k, v in state_dict.items() if k.startswith("student.")}
-
-    if any(k.startswith("backbone.") for k in state_dict):
-        state_dict = {k.replace("backbone.", ""): v for k, v in state_dict.items() if k.startswith("backbone.")}
-
-    if hasattr(model, "teacher"):
-        student_backbone = model.student.backbone
-    elif hasattr(model, "backbone"):
-        student_backbone = model.backbone
-    else:
-        raise ValueError("Pretrained load expects model with teacher or backbone")
-
-    load_msg = student_backbone.load_state_dict(state_dict, strict=True)
-    logger.info("Loaded dinov2 backbone with msg: %s", load_msg)
-
-def _load_dinov3_pretrained_backbone(cfg, model):
-    ckpt_path = cfg.train.pretrained_ckpt
-    logger.info("Loading dinov3 pretrained backbone from: %s", ckpt_path)
-    state_dict = torch.load(ckpt_path, map_location="cpu")
-    if "teacher" in state_dict:
-        state_dict = state_dict["teacher"]
-    elif "backbone" in state_dict:
-        state_dict = state_dict["backbone"]
-    else:
-        raise ValueError("DINOv3 checkpoint must contain 'teacher' or 'backbone'")
-
-    if any(k.startswith("backbone.") for k in state_dict):
-        state_dict = {k.replace("backbone.", ""): v for k, v in state_dict.items() if k.startswith("backbone.")}
-
-    if hasattr(model, "teacher"):
-        student_backbone = model.student.backbone
-    elif hasattr(model, "backbone"):
-        student_backbone = model.backbone
-    else:
-        raise ValueError("Pretrained load expects model with teacher or backbone")
-
-    load_msg = student_backbone.load_state_dict(state_dict, strict=True)
-    logger.info("Loaded dinov3 backbone with msg: %s", load_msg)
-
-
 def _load_pretrained_backbone(cfg, model):
-    source = cfg.train.pretrained_source
-    if source == "pixio":
-        return _load_pixio_pretrained_backbone(cfg, model)
-    if source == "dinov3":
-        return _load_dinov3_pretrained_backbone(cfg, model)
-    if source != "dinov2":
-        raise ValueError("cfg.train.pretrained_source must be 'dinov2', 'pixio', or 'dinov3'")
+    def _iter_vit_blocks(backbone):
+        if backbone.chunked_blocks:
+            for chunk in backbone.blocks:
+                for blk in chunk:
+                    if not isinstance(blk, torch.nn.Identity):
+                        yield blk
+        else:
+            for blk in backbone.blocks:
+                yield blk
 
-    ckpt_path = cfg.train.get("pretrained_ckpt")
-    if ckpt_path:
-        return _load_dinov2_pretrained_backbone(cfg, model)
+    def _mlp_kind(block):
+        if hasattr(block.mlp, "fc1"):
+            return "mlp"
+        if hasattr(block.mlp, "w12"):
+            return "swiglu"
+        raise AssertionError("Unsupported FFN block type")
 
     hub_name = _resolve_torchhub_name(cfg)
     logger.info("Loading pretrained backbone from torch.hub: %s", hub_name)
@@ -770,7 +676,7 @@ def do_test(cfg, model, iteration): # save teacher checkpoint (used for eval onl
             return
 
         teacher, _ = build_model_from_cfg(cfg, only_teacher=True)
-        if cfg.lora.enabled:
+        if cfg.peft.enabled:
             _apply_lora_to_backbone(cfg, teacher)
         teacher_state = torch.load(ckp_path, map_location="cpu")["teacher"]
         teacher_state = {k.replace("module.", ""): v for k, v in teacher_state.items()}
@@ -814,7 +720,7 @@ def do_test(cfg, model, iteration): # save teacher checkpoint (used for eval onl
             return
 
         teacher, _ = build_model_from_cfg(cfg, only_teacher=True)
-        if cfg.lora.enabled:
+        if cfg.peft.enabled:
             _apply_lora_to_backbone(cfg, teacher)
         backbone_state = torch.load(ckp_path, map_location="cpu")["backbone"]
         backbone_state = {k.replace("module.", ""): v for k, v in backbone_state.items()}
@@ -1204,10 +1110,6 @@ def do_test(cfg, model, iteration): # save teacher checkpoint (used for eval onl
             step=step,
         )
 
-    if cfg.model.family == "dinov3":
-        logger.info("Skipping PCam evaluation for dinov3 family")
-        return
-
     pcam_root = str(cfg.evaluation.pcam_root)
 
     def _pcam_h5_path(root, split, key):
@@ -1378,13 +1280,10 @@ def do_test(cfg, model, iteration): # save teacher checkpoint (used for eval onl
 def do_train(cfg, model, resume=False):
     model.train()
     objective = cfg.train.objective
-    dtype_map = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
-    inputs_dtype = dtype_map[cfg.compute_precision.student.backbone.mixed_precision.param_dtype]
+    inputs_dtype = torch.half
     fp16_scaler = model.fp16_scaler  # for mixed precision training
-    # if distributed.is_main_process():
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info("Trainable parameters: %s", trainable_params)
-    print(f"Trainable parameters: {trainable_params}", flush=True)
+    total_params = sum(p.numel() for p in model.parameters())
     if cfg.train.skip_checkpointer:
         print(f"\n\nSkipping FSDP checkpointer (cfg.train.skip_checkpointer={cfg.train.skip_checkpointer})\n\n")
 
@@ -1410,9 +1309,12 @@ def do_train(cfg, model, resume=False):
             run_id = wandb.util.generate_id()
             run_id_path.write_text(run_id)
             resume_mode = "allow"
+        wandb_config = OmegaConf.to_container(cfg) # add trainable/total params to wandb config
+        wandb_config["trainable_params"] = trainable_params
+        wandb_config["total_params"] = total_params
         run = wandb.init(
             project="tcga-finetuning",
-            config=OmegaConf.to_container(cfg),
+            config=wandb_config,
             id=run_id,
             resume=resume_mode,
         )
@@ -1420,6 +1322,8 @@ def do_train(cfg, model, resume=False):
         files_to_save = [
             Path(__file__).resolve(),
             AUGMENTATION_FILE,
+            VISION_TRANSFORMER_FILE,
+            SSL_META_ARCH,
             Path(CONFIG_FILE_PATH),
         ]
         run_script = os.environ.get("DINOV2_RUN_SCRIPT")
@@ -1428,6 +1332,10 @@ def do_train(cfg, model, resume=False):
         for src in files_to_save:
             base_path = repo_root if src.is_relative_to(repo_root) else src.parent
             run.save(str(src), base_path=str(base_path), policy="now")
+        logger.info("Trainable parameters: %s", trainable_params)
+        logger.info("Total parameters: %s", total_params)
+        print(f"Trainable parameters: {trainable_params}")
+        print(f"Total parameters: {total_params}")
 
     # checkpointer
     if not cfg.train.skip_checkpointer:
@@ -1575,41 +1483,7 @@ def do_train(cfg, model, resume=False):
         sample_list_path = str(cfg.train.sample_list_path)
         if not sample_list_path:
             raise ValueError("cfg.train.sample_list_path must be set when streaming_from_hf is False")
-        dataset_root = str(cfg.train.dataset_root)
-        if not dataset_root:
-            raise ValueError("cfg.train.dataset_root must be set when streaming_from_hf is False")
-        dataset_str = f"pathology:root={dataset_root}:sample_list_path={sample_list_path}"
-        tcga_project_id = getattr(cfg.train, "tcga_project_id", None)
-        if tcga_project_id is not None:
-            tcga_project_id_str = str(tcga_project_id).strip()
-            if tcga_project_id_str and tcga_project_id_str.lower() != "null":
-                dataset_str = f"{dataset_str}:tcga_project_id={tcga_project_id_str}"
-        def _normalize_mpp_value(value, name):
-            if value is None:
-                return None
-            if isinstance(value, str):
-                value = value.strip()
-                if not value or value.lower() == "null":
-                    return None
-            parsed = float(value)
-            if parsed <= 0:
-                raise ValueError(f"cfg.train.{name} must be > 0")
-            return parsed
-
-        mpp_min = _normalize_mpp_value(getattr(cfg.train, "MPP_min", None), "MPP_min")
-        mpp_max = _normalize_mpp_value(getattr(cfg.train, "MPP_max", None), "MPP_max")
-        if mpp_min is not None:
-            dataset_str = f"{dataset_str}:mpp_min={mpp_min}"
-        if mpp_max is not None:
-            dataset_str = f"{dataset_str}:mpp_max={mpp_max}"
-        global_crops_scale = cfg.crops.global_crops_scale
-        global_scale_min = min(global_crops_scale)
-        global_scale_max = max(global_crops_scale)
-        dataset_str = (
-            f"{dataset_str}:global_crops_size={cfg.crops.global_crops_size}"
-            f":global_crops_scale_min={global_scale_min}"
-            f":global_crops_scale_max={global_scale_max}"
-        )
+        dataset_str = f"pathology:root=/data/TCGA/:sample_list_path={sample_list_path}"
         dataset = make_dataset(
             dataset_str=dataset_str,
             transform=data_transform,
@@ -1662,6 +1536,8 @@ def do_train(cfg, model, resume=False):
 
         #Save instantly
         if cfg.evaluation.eval_period_iterations >= 0 and (iteration) % cfg.evaluation.eval_period_iterations == 0:
+            if distributed.is_main_process() and wandb.run is not None:
+                _log_crops_to_wandb(data, iteration)
             do_test(cfg, model, f"training_{iteration}")
             torch.cuda.synchronize()
         if not cfg.train.skip_checkpointer:
@@ -1698,6 +1574,7 @@ def do_train(cfg, model, resume=False):
 
         # clip gradients
 
+        grad_norm = None
         if fp16_scaler is not None:
             if objective == "lejepa":
                 fp16_scaler.unscale_(optimizer)
@@ -1711,10 +1588,11 @@ def do_train(cfg, model, resume=False):
                 fp16_scaler.update()
                 amp_scale = fp16_scaler.get_scale()
             else:
+                fp16_scaler.unscale_(optimizer)
                 if cfg.optim.clip_grad:
-                    fp16_scaler.unscale_(optimizer)
-                    for v in model.student.values():
-                        v.clip_grad_norm_(cfg.optim.clip_grad)
+                    grad_norm = _clip_grad_norm_for_student(model.student, cfg.optim.clip_grad)
+                else:
+                    grad_norm = _compute_grad_norm(model)
                 fp16_scaler.step(optimizer)
                 fp16_scaler.update()
         else:
@@ -1729,8 +1607,9 @@ def do_train(cfg, model, resume=False):
                 amp_scale = 1.0
             else:
                 if cfg.optim.clip_grad:
-                    for v in model.student.values():
-                        v.clip_grad_norm_(cfg.optim.clip_grad)
+                    grad_norm = _clip_grad_norm_for_student(model.student, cfg.optim.clip_grad)
+                else:
+                    grad_norm = _compute_grad_norm(model)
                 optimizer.step()
 
         # perform teacher EMA update
@@ -1813,6 +1692,8 @@ def do_train(cfg, model, resume=False):
             }
             if objective == "dinov2":
                 scalar_logs["Momentum"] = mom
+            if grad_norm is not None:
+                scalar_logs["Grad Norm"] = grad_norm
             wandb.log({**scalar_logs, **loss_dict_reduced}, step=iteration)
     
         # Synchronize the GPU to ensure all operations are complete before measuring
@@ -1826,23 +1707,18 @@ def do_train(cfg, model, resume=False):
 def main(args):
     cfg = setup(args)
     print(cfg)
-    move_to_cuda = cfg.model.family != "dinov3"
     if cfg.train.objective == "dinov2":
-        model = SSLMetaArch(cfg)
+        model = SSLMetaArch(cfg).to(torch.device("cuda"))
     elif cfg.train.objective == "lejepa":
-        model = LeJEPAMetaArch(cfg)
+        model = LeJEPAMetaArch(cfg).to(torch.device("cuda"))
     else:
         raise ValueError("cfg.train.objective must be 'dinov2' or 'lejepa'")
-    if move_to_cuda:
-        model = model.to(torch.device("cuda"))
     #Load model here from pretrained.
     if cfg.train.use_pretrained:
         _load_pretrained_backbone(cfg, model)
-    _enable_lora(cfg, model)
+    _enable_peft(cfg, model)
 
     model.prepare_for_distributed_training()
-    if not move_to_cuda:
-        model = model.to(torch.device("cuda"))
     logger.info("Model:\n{}".format(model))
 
     if args.eval_only and not cfg.train.skip_checkpointer:

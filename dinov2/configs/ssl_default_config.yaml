@@ -1,7 +1,5 @@
 MODEL:
   WEIGHTS: ''
-model:
-  family: dinov2
 compute_precision:
   grad_scaler: true
   teacher:
@@ -73,7 +71,6 @@ train:
   objective: dinov2
   batch_size_per_gpu: 64
   dataset_path: ImageNet:split=TRAIN
-  dataset_root: ""
   output_dir: .
   saveckp_freq: 20
   skip_checkpointer: null  # if null, auto-skip when running on a single GPU
@@ -104,6 +101,8 @@ teacher:
   teacher_temp: 0.07
   warmup_teacher_temp_epochs: 30
 optim:
+  optimizer: AdamW
+  lr_schedule: CosineScheduler
   epochs: 100
   weight_decay: 0.04
   weight_decay_end: 0.4
