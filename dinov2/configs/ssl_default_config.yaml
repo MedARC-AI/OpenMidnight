@@ -126,7 +126,7 @@ crops:
   global_crops_size: 224
   local_crops_size: 96
 evaluation:
-  eval_period_iterations: 12500
+  eval_period_iterations: 2500
   bach_root: /data/eva-data/bach
   breakhis_root: /data/eva-data/breakhis
   pcam_root: /data/eva-data/patch_camelyon
