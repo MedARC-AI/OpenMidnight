@@ -15,28 +15,38 @@ logger = logging.getLogger("dinov2")
 
 
 try:
-    from xformers.ops import cross_entropy
-
-    def lossfunc(t, s, temp):
+    from xformers.ops.common import cross_entropy
+    #from flash_attn.ops.triton.cross_entropy import cross_entropy_loss
+    def lossfunc(s:torch.Tensor, t:torch.Tensor, temp):
         s = s.float()
         t = t.float()
         if s.ndim == 2:
             return -cross_entropy(s.unsqueeze(0), t.unsqueeze(0), temp, bw_inplace=True).squeeze(0)
         elif s.ndim == 3:
             return -cross_entropy(s, t, temp, bw_inplace=True)
-
 except ImportError:
+    try:
+        from .fused_ce_loss import cross_entropy
+        def lossfunc(s, t, temp):
+            return -cross_entropy(s/temp, t, reduction="none", chunksize=256)
+    except ImportError:
+        def lossfunc(s, t, temp):
+            return F.cross_entropy(s/temp, t, reduction="none")
+            #return torch.sum(t * F.log_softmax(s / temp, dim=-1), dim=-1)
 
-    def lossfunc(t, s, temp):
-        return torch.sum(t * F.log_softmax(s / temp, dim=-1), dim=-1)
 
-
-class iBOTPatchLoss(nn.Module):
-    def __init__(self, patch_out_dim, student_temp=0.1, center_momentum=0.9):
+class PatchDINOCenter(nn.Module):
+    def __init__(
+        self,
+        patch_out_dim,
+        enable=True,
+        center_momentum=0.9,
+    ):
         super().__init__()
-        self.student_temp = student_temp
-        self.center_momentum = center_momentum
+        if not enable:
+            return
         self.register_buffer("center", torch.zeros(1, 1, patch_out_dim))
+        self.center_momentum = center_momentum
         self.updated = True
         self.reduce_handle = None
         self.len_teacher_patch_tokens = None
@@ -89,6 +99,48 @@ class iBOTPatchLoss(nn.Module):
         Q *= B  # the columns must sum to 1 so that Q is an assignment
         return Q.t()
 
+class CosinePatchLoss(PatchDINOCenter):
+    def __init__(self, patch_out_dim, center=False, center_momentum=0.9, **kwargs):
+        super().__init__(patch_out_dim, center, center_momentum)
+    
+    def forward(self, student_patch_tokens, teacher_patch_tokens, student_masks_flat):
+        """
+        Cross-entropy between softmax outputs of the teacher and student networks.
+        student_patch_tokens: (B, N, D) tensor
+        teacher_patch_tokens: (B, N, D) tensor
+        student_masks_flat: (B, N) tensor
+        """
+        loss = F.cosine_similarity(teacher_patch_tokens, student_patch_tokens, dim=-1)
+        loss = torch.sum(loss * student_masks_flat.float(), dim=-1) / student_masks_flat.sum(dim=-1).clamp(min=1.0)
+        comp_loss= -loss.mean()
+        return comp_loss, {"comp_loss": comp_loss.detach()}
+
+    def forward_masked(
+        self,
+        student_patch_tokens_masked,
+        teacher_patch_tokens_masked,
+        student_masks_flat,
+        n_masked_patches=None,
+        masks_weight=None,
+    ):
+        loss = F.cosine_similarity(teacher_patch_tokens_masked, student_patch_tokens_masked, dim=-1)
+        if masks_weight is None:
+            masks_weight = (
+                (1 / student_masks_flat.sum(-1).clamp(min=1.0))
+                .unsqueeze(-1)
+                .expand_as(student_masks_flat)[student_masks_flat]
+            )
+        if n_masked_patches is not None:
+            loss = loss[:n_masked_patches]
+        loss = loss * masks_weight
+        comp_loss = -loss.sum() / student_masks_flat.shape[0]
+        return comp_loss, {"comp_loss": comp_loss.detach()}
+
+class iBOTPatchLoss(PatchDINOCenter):
+    def __init__(self, patch_out_dim, student_temp=0.1, center_momentum=0.9, **kwargs):
+        super().__init__(patch_out_dim, center_momentum)
+        self.student_temp = student_temp
+
     def forward(self, student_patch_tokens, teacher_patch_tokens, student_masks_flat):
         """
         Cross-entropy between softmax outputs of the teacher and student networks.
@@ -113,7 +165,7 @@ class iBOTPatchLoss(nn.Module):
         t = teacher_patch_tokens_masked
         s = student_patch_tokens_masked
         # loss = torch.sum(t * F.log_softmax(s / self.student_temp, dim=-1), dim=-1)
-        loss = lossfunc(t, s, self.student_temp)
+        loss = lossfunc(s, t, self.student_temp)
         if masks_weight is None:
             masks_weight = (
                 (1 / student_masks_flat.sum(-1).clamp(min=1.0))
