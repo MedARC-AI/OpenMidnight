@@ -28,7 +28,7 @@ trainer:
           patience: ${oc.env:PATIENCE, 7}
           monitor: *MONITOR_METRIC
           mode: *MONITOR_METRIC_MODE
-      - class_path: eva.callbacks.ClassificationEmbeddingsWriter
+      - class_path: eva.callbacks.ClassificationEmbeddingsInMemoryWriter
         init_args:
           output_dir: &DATASET_EMBEDDINGS_ROOT ${oc.env:EMBEDDINGS_ROOT, ./data/embeddings}/${oc.env:MODEL_NAME, vitg14_reg}/crc
           dataloader_idx_map:
@@ -42,7 +42,7 @@ trainer:
                 repo_or_dir: facebookresearch/dinov2 
                 model: dinov2_vitg14_reg 
                 pretrained: true
-              checkpoint_path: ../checkpoints/teacher_epoch250000.pth
+              checkpoint_path: ${oc.env:CHECKPOINT_PATH, ../checkpoints/teacher_epoch250000.pth}
  
           overwrite: true
     logger:
@@ -74,20 +74,20 @@ data:
   init_args:
     datasets:
       train:
-        class_path: eva.datasets.EmbeddingsClassificationDataset
+        class_path: eva.datasets.InMemoryEmbeddingsClassificationDataset
         init_args: &DATASET_ARGS
           root: *DATASET_EMBEDDINGS_ROOT
           manifest_file: manifest.csv
           split: train
       val:
-        class_path: eva.datasets.EmbeddingsClassificationDataset
+        class_path: eva.datasets.InMemoryEmbeddingsClassificationDataset
         init_args:
           <<: *DATASET_ARGS
           split: val
       predict:
         - class_path: eva.vision.datasets.CRC
           init_args: &PREDICT_DATASET_ARGS
-            root: ${oc.env:DATA_ROOT, ./data/crc}
+            root: ${oc.env:DATA_ROOT, /block/eva-data/crc}
             split: train
             download: True
             # Set `download: true` to download the dataset from https://zenodo.org/records/1214456

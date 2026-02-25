@@ -40,15 +40,13 @@ model:
   class_path: eva.vision.models.modules.SemanticSegmentationModule
   init_args:
     encoder:
-      
-      class_path: eva.core.models.wrappers.ModelFromFunction
+      class_path: eva.core.models.wrappers.TorchHubModel
       init_args:
-        path: torch.hub.load
-        arguments:
-          repo_or_dir: facebookresearch/dinov2
-          model: dinov2_vitg14_reg
-          pretrained: true
-        checkpoint_path: ../checkpoints/teacher_epoch250000.pth
+        repo_or_dir: facebookresearch/dinov2
+        model_name: dinov2_vitg14_reg
+        pretrained: true
+        out_indices: 1
+        checkpoint_path: ${oc.env:CHECKPOINT_PATH, ../checkpoints/teacher_epoch250000.pth}
     decoder:
       class_path: eva.vision.models.networks.decoders.segmentation.ConvDecoderWithImage
       init_args:
@@ -97,7 +95,7 @@ data:
       train:
         class_path: eva.vision.datasets.CoNSeP
         init_args: &DATASET_ARGS
-          root: ${oc.env:DATA_ROOT, ./data/consep}
+          root: ${oc.env:DATA_ROOT, /block/eva-data/consep}
           split: train
           sampler: eva.vision.data.wsi.patching.samplers.GridSampler
           transforms:
@@ -119,4 +117,3 @@ data:
       val:
         batch_size: *BATCH_SIZE
         num_workers: *N_DATA_WORKERS
-
