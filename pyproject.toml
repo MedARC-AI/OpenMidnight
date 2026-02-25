@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = "==3.10.12"
 dependencies = [
+    "pillow-simd",
     "einops>=0.8.1",
     "datasets>=2.20.0",
     "fvcore>=0.1.5.post20221221",
@@ -52,3 +53,6 @@ build-backend = "setuptools.build_meta"
 [tool.uv.pip]
 # Use uv's auto detection when installing via `uv pip`
 torch-backend = "auto"
+
+[tool.uv]
+exclude-dependencies= ["pillow"]
