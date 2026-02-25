@@ -137,7 +137,7 @@ Then, install the eva framework to enable use of the `eva` command in your termi
 uv pip install -e './eva-probe[vision]' --no-deps
 ```
 
-We provide every YAML config file we used in our replication in `openmidnight/eval_configs/`. Not every dataset permits automatic downloading. For datasets like BACH that do, we automatically download the dataset when you specify `DOWNLOAD_DATA=true` when calling `eva predict_fit`. For other datasets, follow the manual download steps described in the [eva datasets documentation](https://kaiko-ai.github.io/eva/main/datasets/) and place a folder containing the dataset into `openmidnight/eva-probe/data/`. Consult each dataset's specific YAML config for details on whether automatic downloading is supported; if not, modify the config to provide the path to your dataset prior to eva benchmarking.
+We provide every YAML config file we used in our replication in `openmidnight/eval_configs/`. Not every dataset permits automatic downloading. For datasets like BACH that do, we automatically download the dataset when you specify `DOWNLOAD_DATA=true` when calling `eva predict_fit`. For other datasets, follow the manual download steps described in the [eva datasets documentation](https://kaiko-ai.github.io/eva/main/datasets/) and revise each YAML config to provide the path to your downloaded dataset prior to eva benchmarking.
 
 Below are the steps for running the [BACH](https://kaiko-ai.github.io/eva/main/datasets/bach/) evaluation. If your teacher checkpoint is not stored as `openmidnight/checkpoints/teacher_epoch250000.pth`, you will first need to modify your eva YAML file's `checkpoint_path` variable to specify the path to your model weights.
 
