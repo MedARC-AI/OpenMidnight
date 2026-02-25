@@ -15,7 +15,7 @@ ibot:
   head_n_prototypes: 131072 
 train:
   sample_list_path: /block/TCGA/sample_dataset_30.txt # gives paths to svs files for data loading if streaming_from_hf=False
-  streaming_from_hf: true # if True, dataset is streamed from HuggingFace Hub, and sample_list_path is ignored. You should lower num_workers to 4
+  streaming_from_hf: false # if True, dataset is streamed from HuggingFace Hub, and sample_list_path is ignored. You should lower num_workers to 4
   streaming_dataset_path: medarc/TCGA-12K-parquet
   batch_size_per_gpu: 48
   centering: sinkhorn_knopp
