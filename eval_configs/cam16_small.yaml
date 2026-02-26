@@ -29,7 +29,7 @@ trainer:
           patience: ${oc.env:PATIENCE, 20}
           monitor: *MONITOR_METRIC
           mode: *MONITOR_METRIC_MODE
-      - class_path: eva.callbacks.ClassificationEmbeddingsWriter
+      - class_path: eva.callbacks.ClassificationMultiEmbeddingsInMemoryWriter
         init_args:
           output_dir: &DATASET_EMBEDDINGS_ROOT ${oc.env:EMBEDDINGS_ROOT, ./data/embeddings/${oc.env:MODEL_NAME, vitg14_reg}/camelyon16}
           save_every_n: 10_000
@@ -46,7 +46,7 @@ trainer:
                 repo_or_dir: facebookresearch/dinov2 
                 model: dinov2_vitg14_reg
                 pretrained: true
-              checkpoint_path: ../checkpoints/teacher_epoch250000.pth
+              checkpoint_path: ${oc.env:CHECKPOINT_PATH, ../checkpoints/teacher_epoch250000.pth}
 
           overwrite: true
     logger:
@@ -78,7 +78,7 @@ data:
   init_args:
     datasets:
       train:
-        class_path: eva.datasets.MultiEmbeddingsClassificationDataset
+        class_path: eva.datasets.InMemoryMultiEmbeddingsClassificationDataset
         init_args: &DATASET_ARGS
           root: *DATASET_EMBEDDINGS_ROOT
           manifest_file: manifest.csv
@@ -86,23 +86,25 @@ data:
           embeddings_transforms:
             class_path: eva.core.data.transforms.Pad2DTensor
             init_args:
-              pad_size: &N_PATCHES ${oc.env:N_PATCHES, 10000}
+              pad_size: &N_PATCHES ${oc.env:N_PATCHES, 1000}
           target_transforms:
-            class_path: eva.core.data.transforms.dtype.ArrayToFloatTensor
+            class_path: torchvision.transforms.v2.ToDtype
+            init_args:
+              dtype: torch.float32
       val:
-        class_path: eva.datasets.MultiEmbeddingsClassificationDataset
+        class_path: eva.datasets.InMemoryMultiEmbeddingsClassificationDataset
         init_args:
           <<: *DATASET_ARGS
           split: val
       test:
-        class_path: eva.datasets.MultiEmbeddingsClassificationDataset
+        class_path: eva.datasets.InMemoryMultiEmbeddingsClassificationDataset
         init_args:
           <<: *DATASET_ARGS
           split: test
       predict:
         - class_path: eva.vision.datasets.Camelyon16
           init_args: &PREDICT_DATASET_ARGS
-            root: ${oc.env:DATA_ROOT, ./data/camelyon16}
+            root: ${oc.env:DATA_ROOT, /block/eva-data/camelyon16}
             sampler:
               class_path: eva.vision.data.wsi.patching.samplers.ForegroundGridSampler
               init_args:
@@ -140,4 +142,3 @@ data:
       predict:
         batch_size: &PREDICT_BATCH_SIZE ${oc.env:PREDICT_BATCH_SIZE, 64}
         num_workers: *N_DATA_WORKERS
-

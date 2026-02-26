@@ -14,16 +14,16 @@ ibot:
   separate_head: true
   head_n_prototypes: 131072 
 train:
-  sample_list_path: /data/TCGA/sample_dataset_30.txt # gives paths to svs files for data loading if streaming_from_hf=False
-  streaming_from_hf: true
+  sample_list_path: /block/TCGA/sample_dataset_30.txt # gives paths to svs files for data loading if streaming_from_hf=False
+  streaming_from_hf: false # if True, dataset is streamed from HuggingFace Hub, and sample_list_path is ignored. You should lower num_workers to 4
   streaming_dataset_path: medarc/TCGA-12K-parquet
   batch_size_per_gpu: 48
   centering: sinkhorn_knopp
   use_pretrained: True
   OFFICIAL_EPOCH_LENGTH: 1250
-  num_workers: 4
-  skip_checkpointer: true
-  # unfreeze_last_n_blocks: 3
+  num_workers: 24 # set to 4 if streaming_from_hf=True
+  prefetch_factor: 8
+  skip_checkpointer: true # set True if you don't need to resume training (this yields training speedup and less space usage)
 student:
   arch: vit_giant2
   patch_size: 14
@@ -34,8 +34,8 @@ student:
 teacher:
   momentum_teacher: 0.994
 optim:
-  epochs: 8000 
-  early_stop: 200 # we want to early stop at 200 epochs to replicate SOTA ckpt
+  epochs: 200 # 8000 with early_stop=200 was used for blog post ckpt
+  early_stop: 200 
   weight_decay_end: 0.2
   base_lr: 2.0e-04  # learning rate for a batch size of 1024 (swapped from 3.5e-4 to 2.0e-4)
   warmup_epochs: 10
@@ -43,7 +43,7 @@ optim:
 crops:
   local_crops_size: 98
 evaluation:
-  eval_period_iterations: 1250 # save checkpoint every 10 epochs
+  eval_period_iterations: 5000 # save checkpoint every 10 epochs
   bach_root: /data/eva-data/bach
   breakhis_root: /data/eva-data/breakhis
   pcam_root: /data/eva-data/patch_camelyon

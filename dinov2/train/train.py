@@ -992,9 +992,9 @@ def do_train(cfg, model, resume=False):
     if not cfg.train.skip_checkpointer:
         periodic_checkpointer = PeriodicCheckpointer(
             checkpointer,
-            period=3 * OFFICIAL_EPOCH_LENGTH,
+            period=5 * OFFICIAL_EPOCH_LENGTH,
             max_iter=max_iter,
-            max_to_keep=3,
+            max_to_keep=1,
         )
 
     # setup data preprocessing

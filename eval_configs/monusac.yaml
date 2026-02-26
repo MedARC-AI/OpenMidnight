@@ -40,20 +40,13 @@ model:
   class_path: eva.vision.models.modules.SemanticSegmentationModule
   init_args:
     encoder:
-       #class_path: eva.vision.models.ModelFromRegistry
-        #init_args:
-        #model_name: ${oc.env:MODEL_NAME, universal/vit_small_patch16_224_dino}
-        #model_kwargs:
-          #out_indices: ${oc.env:OUT_INDICES, 1}
-        #model_extra_kwargs: ${oc.env:MODEL_EXTRA_KWARGS, null}
-      class_path: eva.core.models.wrappers.ModelFromFunction
+      class_path: eva.core.models.wrappers.TorchHubModel
       init_args:
-        path: torch.hub.load
-        arguments:
-          repo_or_dir: facebookresearch/dinov2 
-          model: dinov2_vitg14_reg 
-          pretrained: true
-        checkpoint_path: ../checkpoints/teacher_epoch250000.pth
+        repo_or_dir: facebookresearch/dinov2 
+        model_name: dinov2_vitg14_reg 
+        pretrained: true
+        out_indices: 1
+        checkpoint_path: ${oc.env:CHECKPOINT_PATH, ../checkpoints/teacher_epoch250000.pth}
 
     decoder:
       class_path: eva.vision.models.networks.decoders.segmentation.ConvDecoderWithImage
@@ -107,7 +100,7 @@ data:
       train:
         class_path: eva.vision.datasets.MoNuSAC
         init_args: &DATASET_ARGS
-          root: ${oc.env:DATA_ROOT, ./data/monusac}
+          root: ${oc.env:DATA_ROOT, /block/eva-data/monusac}
           split: train
           download: ${oc.env:DOWNLOAD_DATA, false}
           # Set `download: true` to download the dataset from https://monusac-2020.grand-challenge.org/Data/
@@ -148,4 +141,3 @@ data:
       val:
         batch_size: *BATCH_SIZE
         num_workers: *N_DATA_WORKERS
-

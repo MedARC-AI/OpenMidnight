@@ -180,6 +180,7 @@ def make_data_loader(
     drop_last: bool = True,
     persistent_workers: bool = False,
     collate_fn: Optional[Callable[[List[T]], Any]] = None,
+    prefetch_factor: int=2,
 ):
     """
     Creates a data loader with the specified parameters.
@@ -218,6 +219,7 @@ def make_data_loader(
         persistent_workers=persistent_workers,
         collate_fn=collate_fn,
         timeout=600,
+        prefetch_factor=prefetch_factor,
     )
 
     try:
