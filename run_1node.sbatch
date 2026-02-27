@@ -7,7 +7,6 @@
 #SBATCH --output=slurms/%j.out
 #SBATCH --error=slurms/%j.err
 #SBATCH --partition=main
-#SBATCH --exclusive
 #SBATCH --account=training
 
 set -euo pipefail
