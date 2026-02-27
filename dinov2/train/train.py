@@ -1222,6 +1222,10 @@ def do_train(cfg, model, resume=False):
                 torch.distributed.all_reduce(v)
         loss_dict_reduced = {k: v.item() / distributed.get_global_size() for k, v in loss_dict.items()}
 
+        if "total_loss" in loss_dict_reduced:
+            losses_reduced = loss_dict_reduced.pop("total_loss")
+        else:
+            losses_reduced = sum(loss for loss in loss_dict_reduced.values())
         if math.isnan(sum(loss_dict_reduced.values())):
             print(sum(loss_dict_reduced.values()))
             logger.info("NaN detected")
