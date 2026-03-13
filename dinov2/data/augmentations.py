@@ -193,6 +193,103 @@ class RandStainNA(torch.nn.Module):
             return img
         return self.augment(img)
 
+class ElasticDeformation(torch.nn.Module):
+    def __init__(self, low_alpha=40.0, high_alpha=200.0, low_sigma=5.0, high_sigma=10.0, probability=0.5):
+        super().__init__()
+        self.low_alpha = low_alpha
+        self.high_alpha = high_alpha
+        self.low_sigma = low_sigma
+        self.high_sigma = high_sigma
+        self.probability = probability
+
+    def forward(self, img):
+        if random.random() > self.probability:
+            return img
+
+
+        alpha = random.uniform(self.low_alpha, self.high_alpha)
+        sigma = random.uniform(self.low_sigma, self.high_sigma)
+
+        was_pil = False
+        was_tensor = False
+
+        if isinstance(img, Image.Image):
+            img_np = np.array(img)
+            was_pil = True
+        elif isinstance(img, torch.Tensor):
+            img_np = (img.permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+            was_tensor = True
+        else:
+            img_np = img
+
+        shape = img_np.shape
+        h, w = shape[:2]
+
+        dx = cv2.GaussianBlur((np.random.rand(h, w) * 2 - 1).astype(np.float32), 
+                              (0, 0), sigma) * alpha
+        dy = cv2.GaussianBlur((np.random.rand(h, w) * 2 - 1).astype(np.float32), 
+                              (0, 0), sigma) * alpha
+
+        x, y = np.meshgrid(np.arange(w), np.arange(h))
+
+        map_x = (x + dx).astype(np.float32)
+        map_y = (y + dy).astype(np.float32)
+
+        distorted_img = cv2.remap(img_np, map_x, map_y, 
+                                  interpolation=cv2.INTER_LINEAR, 
+                                  borderMode=cv2.BORDER_REFLECT_101)
+
+        if was_pil:
+            return Image.fromarray(distorted_img)
+        elif was_tensor:
+            return torch.from_numpy(distorted_img).permute(2, 0, 1).float() / 255.0
+
+        return distorted_img
+
+class JpegCompression(torch.nn.Module):
+
+    def __init__(self, quality_lower=20, quality_upper=100, probability=0.5):
+        super().__init__()
+        self.quality_lower = quality_lower
+        self.quality_upper = quality_upper
+        self.probability = probability
+
+    def forward(self, img):
+        if random.random() > self.probability:
+            return img
+
+        quality = random.randint(self.quality_lower, self.quality_upper)
+
+        was_pil = False
+        was_tensor = False
+
+        if isinstance(img, Image.Image):
+            img_np = np.array(img)
+            was_pil = True
+        elif isinstance(img, torch.Tensor):
+
+            img_np = (img.permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+            was_tensor = True
+        else:
+            img_np = img
+
+        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+
+        encode_param =[int(cv2.IMWRITE_JPEG_QUALITY), quality]
+        result, encimg = cv2.imencode('.jpg', img_bgr, encode_param)
+
+        if result:
+            decimg = cv2.imdecode(encimg, 1)
+            img_rgb = cv2.cvtColor(decimg, cv2.COLOR_BGR2RGB)
+        else:
+            img_rgb = img_np
+
+        if was_pil:
+            return Image.fromarray(img_rgb)
+        elif was_tensor:
+            return torch.from_numpy(img_rgb).permute(2, 0, 1).float() / 255.0
+
+        return img_rgb
 
 class hed_mod(torch.nn.Module):
     """
