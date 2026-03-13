@@ -150,7 +150,7 @@ All eva evaluations should be run on a single GPU by setting `CUDA_VISIBLE_DEVIC
 
 ## HEST Benchmark
 
-First ensure you have a checkpoint ready to be evaluated. Place the .pth file for your teacher model in the /checkpoints folder. You can download our pretrained checkpoint here: *insert URL here*
+First ensure you have a checkpoint ready to be evaluated. Place the .pth file for your teacher model in the /checkpoints folder. You can download our pretrained checkpoint here: https://huggingface.co/SophontAI/OpenMidnight/blob/main/teacher_checkpoint.pth
 
 Then, `cd` into the same `openmidnight` folder cloned from our Installation steps and clone the [Mahmood Lab's HEST GitHub repo](https://github.com/mahmoodlab/HEST):
 
