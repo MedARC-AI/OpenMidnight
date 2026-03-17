@@ -31,11 +31,13 @@ student:
   ffn_layer: swiglufused
   block_chunks: 4
   num_register_tokens: 4
+  interpolate_antialias: true # RSG - added from Paul's update
+  interpolate_offset: 0.0
 teacher:
   momentum_teacher: 0.994
 optim:
-  epochs: 200 # 8000 with early_stop=200 was used for blog post ckpt
-  early_stop: 200 
+  epochs: 110 # 8000 with early_stop=200 was used for blog post ckpt
+  early_stop: 110  # RSG - changed epochs and early_stop from 200 
   weight_decay_end: 0.2
   base_lr: 2.0e-04  # learning rate for a batch size of 1024 (swapped from 3.5e-4 to 2.0e-4)
   warmup_epochs: 10
@@ -43,7 +45,7 @@ optim:
 crops:
   local_crops_size: 98
 evaluation:
-  eval_period_iterations: 5000 # save checkpoint every 10 epochs
+  eval_period_iterations: 2500 # save checkpoint every 10 epochs # RSG - changed from 5000
   bach_root: /data/eva-data/bach
   breakhis_root: /data/eva-data/breakhis
   pcam_root: /data/eva-data/patch_camelyon
