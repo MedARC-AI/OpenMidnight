@@ -41,6 +41,27 @@ optim:
   warmup_epochs: 10
   layerwise_decay: 1.0
 crops:
+  # Choose one of the following modes to test in isolation:
+  # --------------------------------------------------------
+  # "baseline"           : Only RandomResizedCrop + Horizontal Flip (DINOv2 Defaults)
+  # "vflip"              : Baseline + Vertical Flip
+  # "rotate90"           : Baseline + 90-degree Rotations
+  # "colorjitter_weak"   : Baseline + Subtle Color Shifts
+  # "colorjitter_strong" : Baseline + Aggressive Color Shifts
+  # "blur_weak"          : Baseline + Subtle Out-of-focus
+  # "blur_strong"        : Baseline + Heavy Scanner Blur
+  # "hed_weak"           : Baseline + Subtle HED Stain shift (0.03)
+  # "hed_medium"         : Baseline + Standard HED Stain shift (0.08)
+  # "hed_strong"         : Baseline + Aggressive HED Stain shift (0.15)
+  # "randstain_weak"     : Baseline + RandStainNA Normalization (-0.5)
+  # "randstain_medium"   : Baseline + RandStainNA Standard (-0.3)
+  # "randstain_strong"   : Baseline + RandStainNA High Diversity (0.0)
+  # "randstain_hed_combo": Baseline + Both HED and RandStain (To check redundancy)
+  # "elastic"            : Baseline + Tissue Stretching (Slide pulling simulation)
+  # "jpeg"               : Baseline + JPEG Artifacts (Scanner compression simulation)
+  # "combo"              : FULL PIPELINE (All Medium defaults + flips + rotations)
+  # ------------------------------
+  ablation_mode: "elastic"
   local_crops_size: 98
 evaluation:
   eval_period_iterations: 5000 # save checkpoint every 10 epochs
