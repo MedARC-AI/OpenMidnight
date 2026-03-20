@@ -210,41 +210,36 @@ class ElasticDeformation(torch.nn.Module):
         alpha = random.uniform(self.low_alpha, self.high_alpha)
         sigma = random.uniform(self.low_sigma, self.high_sigma)
 
-        was_pil = False
-        was_tensor = False
 
         if isinstance(img, Image.Image):
             img_np = np.array(img)
-            was_pil = True
+            input_type = 'PIL'
         elif isinstance(img, torch.Tensor):
-            img_np = (img.permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
-            was_tensor = True
+            img_np = (img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            input_type = 'Tensor'
         else:
-            img_np = img
-
-        shape = img_np.shape
-        h, w = shape[:2]
-
-        dx = cv2.GaussianBlur((np.random.rand(h, w) * 2 - 1).astype(np.float32), 
-                              (0, 0), sigma) * alpha
-        dy = cv2.GaussianBlur((np.random.rand(h, w) * 2 - 1).astype(np.float32), 
-                              (0, 0), sigma) * alpha
-
+            img_np = np.array(img)
+            input_type = 'Array'
+            
+        h, w = img_np.shape[:2]
+        
+        dx = cv2.GaussianBlur((np.random.rand(h, w) * 2 - 1).astype(np.float32), (0, 0), sigma) * alpha
+        dy = cv2.GaussianBlur((np.random.rand(h, w) * 2 - 1).astype(np.float32), (0, 0), sigma) * alpha
+                              
         x, y = np.meshgrid(np.arange(w), np.arange(h))
-
         map_x = (x + dx).astype(np.float32)
         map_y = (y + dy).astype(np.float32)
+        
+        
+        distorted = cv2.remap(img_np, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
+        
+        
+        if input_type == 'PIL':
+            return Image.fromarray(distorted)
+        elif input_type == 'Tensor':
+            return torch.from_numpy(distorted).permute(2, 0, 1).float() / 255.0
+        return distorted
 
-        distorted_img = cv2.remap(img_np, map_x, map_y, 
-                                  interpolation=cv2.INTER_LINEAR, 
-                                  borderMode=cv2.BORDER_REFLECT_101)
-
-        if was_pil:
-            return Image.fromarray(distorted_img)
-        elif was_tensor:
-            return torch.from_numpy(distorted_img).permute(2, 0, 1).float() / 255.0
-
-        return distorted_img
 
 class JpegCompression(torch.nn.Module):
 
@@ -267,7 +262,6 @@ class JpegCompression(torch.nn.Module):
             img_np = np.array(img)
             was_pil = True
         elif isinstance(img, torch.Tensor):
-
             img_np = (img.permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
             was_tensor = True
         else:
@@ -373,6 +367,7 @@ class DataAugmentationDINO(object):
         local_crops_number,
         global_crops_size=224,
         local_crops_size=96,
+        ablation_mode="baseline", # This controls the abalation choices (baseline only applies the RandomResizeCrop + Horizontal Flip)
     ):
         self.global_crops_scale = global_crops_scale
         self.local_crops_scale = local_crops_scale
@@ -389,73 +384,161 @@ class DataAugmentationDINO(object):
         logger.info(f"local_crops_size: {local_crops_size}")
         logger.info("###################################")
 
-        # Geometric augmentations with rotation and both flips
-        self.geometric_augmentation_global = transforms.Compose(
-            [
-                # RandomRotation90(),
-                transforms.RandomResizedCrop(
-                    global_crops_size, scale=global_crops_scale, interpolation=transforms.InterpolationMode.BICUBIC
-                ),
-                transforms.RandomHorizontalFlip(p=0.5),
-                # transforms.RandomVerticalFlip(p=0.5),
-            ]
-        )
+        # Everything is OFF by default. Only RandomResizedCrop and H-Flip are applied.
+        vflip_p = 0.0
+        rotate90_p = 0.0
+        cj_params = None      # (brightness, contrast, saturation, hue)
+        gb_params = None      # (kernel_size, sigma_min, sigma_max)
+        hed_range = None      
+        rs_hyper = None       
+        use_elastic = False
+        use_jpeg = False
+        # use_ect = False
 
-        self.geometric_augmentation_local = transforms.Compose(
-            [
-                # RandomRotation90(),
-                transforms.RandomResizedCrop(
-                    local_crops_size, scale=local_crops_scale, interpolation=transforms.InterpolationMode.BICUBIC
-                ),
-                transforms.RandomHorizontalFlip(p=0.5),
-                # transforms.RandomVerticalFlip(p=0.5),
-            ]
-        )
+        if ablation_mode == "baseline":
+            pass
+        elif ablation_mode == "vflip":
+            vflip_p = 0.5
+        elif ablation_mode == "rotate90":
+            rotate90_p = 0.5
+            
+        # Color Jitter Ablations
+        elif ablation_mode == "colorjitter_weak":
+            cj_params = (0.1, 0.1, 0.05, 0.02)
+        elif ablation_mode == "colorjitter_medium":
+            cj_params = (0.2, 0.2, 0.1, 0.05)
+        elif ablation_mode == "colorjitter_strong":
+            cj_params = (0.4, 0.4, 0.2, 0.1)
+            
+        # Gaussian Blur Ablations
+        elif ablation_mode == "blur_weak":
+            gb_params = (7, 0.3, 0.8)
+        elif ablation_mode == "blur_medium":
+            gb_params = (9, 0.5, 1)
+        elif ablation_mode == "blur_strong":
+            gb_params = (15, 1.5, 2.5)
+            
+        # HED Ablations
+        elif ablation_mode == "hed_weak":
+            hed_range = 0.005
+        elif ablation_mode == "hed_medium":
+            hed_range = 0.01
+        elif ablation_mode == "hed_strong":
+            hed_range = 0.03
+            
+        # RandStainNA Ablations
+        elif ablation_mode == "randstain_weak":
+            rs_hyper = -0.4
+        elif ablation_mode == "randstain_medium":
+            rs_hyper = -0.1
+        elif ablation_mode == "randstain_strong":
+            rs_hyper = 0.0
+            
+        # Combo Ablations (randstain + hed)
+        elif ablation_mode == "randstain_hed_combo":
+            rs_hyper = -0.3
+            hed_range = 0.08
+            
+        elif ablation_mode == "elastic":
+            use_elastic = True
+            
+        elif ablation_mode == "jpeg":
+            use_jpeg = True
+            
+        elif ablation_mode == "combo":
+            # Combo of all above augmentations that showed improvements in isolation
+            vflip_p = 0.5
+            rotate90_p = 0.5
+            cj_params = (0.2, 0.2, 0.1, 0.05) 
+            gb_params = (9, 0.1, 2.0)
+            hed_range = 0.05
+            rs_hyper = -0.3
+            use_elastic = True
+            use_jpeg = True
+        else:
+            raise ValueError(f"Unknown ablation mode: {ablation_mode}")
 
-        # Normalization (ImageNet stats used by default)
-        self.normalize = transforms.Compose(
-            [
+        # --- 3. LOGGING THE ACTIVE PIPELINE ---
+        logger.info("=========================================")
+        logger.info(f" BUILDING PIPELINE: MODE '{ablation_mode.upper()}' ")
+        logger.info("=========================================")
+        logger.info(f" [ON] RandomResizedCrop (Global: {global_crops_size}, Local: {local_crops_size})")
+        logger.info(f" [ON] HorizontalFlip (p=0.5)")
+        logger.info(f" [{'ON' if vflip_p > 0 else 'OFF'}] VerticalFlip (p={vflip_p})")
+        logger.info(f"[{'ON' if rotate90_p > 0 else 'OFF'}] Rotate90 (p={rotate90_p})")
+        
+        if cj_params:
+            logger.info(f" [ON] ColorJitter (B:{cj_params[0]}, C:{cj_params[1]}, S:{cj_params[2]}, H:{cj_params[3]})")
+        else:
+            logger.info(f" [OFF] ColorJitter")
+            
+        if gb_params:
+            logger.info(f" [ON] GaussianBlur (Kernel:{gb_params[0]}, Sigma range: {gb_params[1]}-{gb_params[2]})")
+        else:
+            logger.info(f" [OFF] GaussianBlur")
+            
+        logger.info(f" [{'ON' if hed_range else 'OFF'}] HED Stain Perturbation (Range: +/-{hed_range})")
+        logger.info(f"[{'ON' if rs_hyper is not None else 'OFF'}] RandStainNA (Std Hyper: {rs_hyper})")
+        logger.info(f"[{'ON' if use_elastic else 'OFF'}] Elastic Deformation")
+        logger.info(f"[{'ON' if use_jpeg else 'OFF'}] JPEG Compression")
+        logger.info("=========================================\n")
+
+
+        geom_global =[
+            transforms.RandomResizedCrop(global_crops_size, scale=global_crops_scale, interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.RandomHorizontalFlip(p=0.5),
+        ]
+        geom_local =[
+            transforms.RandomResizedCrop(local_crops_size, scale=local_crops_scale, interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.RandomHorizontalFlip(p=0.5),
+        ]
+        
+        if vflip_p > 0:
+            geom_global.append(transforms.RandomVerticalFlip(p=vflip_p))
+            geom_local.append(transforms.RandomVerticalFlip(p=vflip_p))
+        if rotate90_p > 0:
+            geom_global.append(RandomRotation90()) 
+            geom_local.append(RandomRotation90())
+            
+        self.geometric_augmentation_global = transforms.Compose(geom_global)
+        self.geometric_augmentation_local = transforms.Compose(geom_local)
+
+        def build_pixel_pipeline(blur_probability):
+            pipeline =[]
+            
+            if use_elastic:
+                pipeline.append(ElasticDeformation(probability=0.5))
+                
+            if rs_hyper is not None:
+                pipeline.append(RandStainNA(color_space='LAB', std_hyper=rs_hyper, distribution='normal', probability=0.5))
+                
+            if hed_range is not None:
+                pipeline.append(hed_mod(probability=0.5, perturbation_range=hed_range))
+                
+            if cj_params is not None:
+                pipeline.append(transforms.RandomApply([transforms.ColorJitter(*cj_params)], p=0.8))
+                pipeline.append(transforms.RandomGrayscale(p=0.2))
+                
+            if gb_params is not None:
+                k, s_min, s_max = gb_params
+                pipeline.append(transforms.RandomApply([transforms.GaussianBlur(kernel_size=k, sigma=(s_min, s_max))], p=blur_probability))
+                
+            if use_jpeg:
+                pipeline.append(JpegCompression(probability=0.5))
+                
+            pipeline.extend([
                 transforms.ToTensor(),
                 make_normalize_transform(),
-            ]
-        )
+            ])
+            return transforms.Compose(pipeline)
 
-        # Pathology-specific stain augmentations
-        randstainna = RandStainNA(
-            color_space='LAB',
-            std_hyper=-0.3,
-            distribution='normal',
-            probability=0.5,
-        )
-
-        hed_aug = hed_mod(probability=0.5, perturbation_range=0.05)
-
-        self.global_transfo1 = transforms.Compose([
-            # randstainna,
-            hed_aug,
-            transforms.RandomApply([transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1, hue=0.05)], p=0.8),
-            transforms.RandomGrayscale(p=0.2),
-            GaussianBlur(p=1.0),
-            self.normalize
-        ])
-
-        self.global_transfo2 = transforms.Compose([
-            # randstainna,
-            hed_aug,
-            transforms.RandomApply([transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1, hue=0.05)], p=0.8),
-            transforms.RandomGrayscale(p=0.2),
-            GaussianBlur(p=0.1),
-            self.normalize
-        ])
-
-        self.local_transfo = transforms.Compose([
-            # randstainna,
-            hed_aug,
-            transforms.RandomApply([transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1, hue=0.05)], p=0.8),
-            transforms.RandomGrayscale(p=0.2),
-            GaussianBlur(p=0.5),
-            self.normalize
-        ])
+        # DINOv2 uses asymmetric blur probabilities for the different crops
+        self.global_transfo1 = build_pixel_pipeline(blur_probability=1.0)
+        self.global_transfo2 = build_pixel_pipeline(blur_probability=0.1)
+        self.local_transfo = build_pixel_pipeline(blur_probability=0.5)
+        
+        # Normalization (ImageNet stats used by default)
+        self.normalize = transforms.Compose([transforms.ToTensor(), make_normalize_transform()])
 
     def __call__(self, image):
         output = {}
