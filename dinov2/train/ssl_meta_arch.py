@@ -384,15 +384,17 @@ class SSLMetaArch(nn.Module):
         # ── Gram (patch-similarity) loss ─────────────────────────────────────
         if self.do_gram:
             gram_cfg = self.cfg.gram
+            # Use full (unmasked) global crop patch tokens from both student and teacher.
+            # Teacher tokens come from get_teacher_output() under @no_grad so they
+            # already have requires_grad=False.
             student_patch_tokens = student_global_backbone_output_dict["x_norm_patchtokens"]
-            gram_loss_val = self.gram_loss_fn(
+            gram_loss_val = gram_cfg.loss_weight * self.gram_loss_fn(
                 student_patch_tokens,
                 gram_teacher_patch_tokens,
                 img_level=gram_cfg.img_level,
             )
-            gram_loss_val = gram_cfg.loss_weight * gram_loss_val
             loss_accumulator += gram_loss_val
-            loss_dict["gram_loss"] = gram_loss_val
+            loss_dict["gram_loss"] = gram_loss_val.detach()
 
         self.backprop_loss(loss_accumulator)
 
