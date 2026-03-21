@@ -1,0 +1,81 @@
+# ViT-G/14 fine-tuned from an EXTERNAL / DINOv3-FORMAT checkpoint.
+#
+# Use this config when you have a pretrained backbone that did NOT come from
+# Meta's released DINOv2 torch.hub weights — for example:
+#   • A checkpoint produced by path-fm-dinov3 (MedARC-AI/path-fm-dinov3)
+#   • Any teacher_checkpoint.pth saved by a prior OpenMidnight run
+#   • A raw backbone .pth in flat or {'model': ...} format
+#
+# The loader (_load_from_external_checkpoint in train.py) auto-detects the
+# format and loads backbone weights with strict=False, so extra keys specific
+# to DINOv3 (e.g. RoPE tensors absent from this model) are safely skipped.
+#
+# How to use
+# ----------
+#   Override train.pretrained_weights at launch time:
+#
+#     torchrun ... train.py \
+#       --config-file .../vitg14_reg4_dinov3init.yaml \
+#       train.pretrained_weights=/path/to/teacher_checkpoint.pth
+#
+#   OR set STAGE1_CHECKPOINT in run_dinov3init.sh and run that script.
+#
+# Key differences vs. vitg14_reg4.yaml (DINOv2 fine-tuning from torch.hub):
+#
+#   use_pretrained: False         — skips torch.hub download
+#   pretrained_weights: ''        — overridden at launch (see above)
+#   base_lr: 5.0e-04              — somewhat higher than pure fine-tuning because
+#                                   the external checkpoint may not perfectly align
+#                                   with this model's architecture
+#   warmup_epochs: 10             — same as fine-tuning default
+#   layerwise_decay: 1.0          — same as fine-tuning default
+dino:
+  head_n_prototypes: 131072
+  head_bottleneck_dim: 384
+  do_kde: True
+  kde_loss_weight: .05
+  koleo_loss_weight: 0
+  do_koleo: False
+ibot:
+  loss_weight: 1.0
+  mask_sample_probability: 0.5
+  mask_ratio_min_max:
+    - 0.1
+    - 0.45
+  separate_head: true
+  head_n_prototypes: 131072
+train:
+  sample_list_path: /block/TCGA/sample_dataset_30.txt
+  streaming_from_hf: false
+  streaming_dataset_path: medarc/TCGA-12K-parquet
+  batch_size_per_gpu: 48
+  centering: sinkhorn_knopp
+  use_pretrained: False         # ← skip torch.hub; we use pretrained_weights below
+  pretrained_weights: ''        # ← OVERRIDE at launch: train.pretrained_weights=/path/to/ckpt.pth
+  OFFICIAL_EPOCH_LENGTH: 1250
+  num_workers: 24
+  prefetch_factor: 8
+  skip_checkpointer: true
+student:
+  arch: vit_giant2
+  patch_size: 14
+  drop_path_rate: 0.4
+  ffn_layer: swiglufused
+  block_chunks: 4
+  num_register_tokens: 4
+teacher:
+  momentum_teacher: 0.994
+optim:
+  epochs: 200
+  early_stop: 200
+  weight_decay_end: 0.2
+  base_lr: 5.0e-04              # ← slightly higher than pure fine-tuning (2e-4)
+  warmup_epochs: 10
+  layerwise_decay: 1.0
+crops:
+  local_crops_size: 98
+evaluation:
+  eval_period_iterations: 5000
+  bach_root: /block/eva-data/bach
+  breakhis_root: /block/eva-data/breakhis
+  pcam_root: /block/eva-data/patch_camelyon
