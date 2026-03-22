@@ -70,6 +70,10 @@ train:
   cache_dataset: true
   centering: "centering" # or "sinkhorn_knopp"
   unfreeze_last_n_blocks: 40
+  # Path to a teacher_checkpoint.pth (or raw backbone .pth) from a prior run or
+  # an external source (e.g. a DINOv3 pretrained backbone).  When non-empty and
+  # use_pretrained is False, this checkpoint is used to warm-start the model.
+  pretrained_weights: ''
 student:
   arch: vit_large
   patch_size: 16
@@ -119,3 +123,14 @@ crops:
 evaluation:
   eval_period_iterations: 12500
   bach_root: /data/eva-data/bach
+# ── DINOv3-style Gram (patch-similarity) loss ─────────────────────────────────
+# Disabled by default.  Set gram.use_loss: true and gram.img_level/loss_weight
+# in a per-run config to enable.  With ema_teacher: true (the default here) no
+# separate model is needed — the EMA teacher's patch tokens are used as targets.
+gram:
+  use_loss: false        # master switch
+  img_level: true        # true → per-image Gram; false → batch-level Gram
+  loss_weight: 0.1       # scalar weight on the gram MSE term
+  normalized: true       # L2-normalise patch features before computing Gram
+  remove_neg: false      # zero-clip negative similarities in both matrices
+  remove_only_teacher_neg: false  # zero-clip teacher negatives only

@@ -290,6 +290,85 @@ def _load_pretrained_backbone(cfg, model):
         student_backbone.norm.bias.copy_(model_pretrained.norm.bias)
 
 
+def _load_from_external_checkpoint(cfg, model):
+    """Warm-start student **and** teacher backbones from an external checkpoint.
+
+    Supports three checkpoint formats that naturally arise in practice:
+
+    1. **OpenMidnight / DINOv3 teacher checkpoint** — saved by ``do_test()``:
+       ``{"teacher": {"backbone.<key>": ..., "dino_head.<key>": ..., ...}}``
+
+    2. **Raw backbone state-dict** — produced by frameworks that save only the
+       backbone (e.g. ``torch.save(model.state_dict(), path)``):
+       ``{"model": {"<key>": ...}}``  *or*  ``{"backbone": {"<key>": ...}}``
+
+    3. **Flat state-dict** — bare ``{<key>: tensor}`` mapping without any
+       nesting prefix (the format Meta uses for released ViT checkpoints).
+
+    In all cases the backbone weights are loaded with ``strict=False`` so that
+    architecture mismatches (e.g. loading a DINOv3 checkpoint into a model
+    without RoPE) are handled gracefully — matching parameters are copied and
+    unexpected keys are simply skipped with a warning.
+
+    Both the student and teacher backbone are initialised from the same
+    checkpoint.  The DINO / iBOT head weights that may be present in a teacher
+    checkpoint are **not** loaded here; the heads are always freshly
+    initialised.
+
+    Config: ``train.pretrained_weights`` — path to the checkpoint file.
+    """
+    path = cfg.train.pretrained_weights
+    if not path:
+        return
+    logger.info("Loading external backbone checkpoint from: %s", path)
+    raw = torch.load(path, map_location="cpu")
+
+    # ── Detect format and extract backbone state-dict ─────────────────────────
+    if isinstance(raw, dict):
+        if "teacher" in raw:
+            # OpenMidnight / DINOv3 teacher checkpoint
+            sd = raw["teacher"]
+            # strip leading "backbone." prefix → plain backbone state-dict
+            sd = {k[len("backbone."):]: v for k, v in sd.items() if k.startswith("backbone.")}
+            logger.info("Detected teacher-checkpoint format; extracted backbone weights.")
+        elif "model" in raw:
+            sd = raw["model"]
+            logger.info("Detected 'model' key format.")
+        elif "backbone" in raw:
+            sd = raw["backbone"]
+            logger.info("Detected 'backbone' key format.")
+        else:
+            # Assume flat state-dict
+            sd = raw
+            logger.info("Detected flat state-dict format.")
+    else:
+        raise ValueError(f"Unrecognised checkpoint type: {type(raw)}")
+
+    student_backbone = model.student.backbone
+    teacher_backbone = model.teacher.backbone
+
+    missing_s, unexpected_s = student_backbone.load_state_dict(sd, strict=False)
+    missing_t, unexpected_t = teacher_backbone.load_state_dict(sd, strict=False)
+
+    if missing_s:
+        logger.warning(
+            "External checkpoint: %d missing keys in student backbone (e.g. %s)",
+            len(missing_s),
+            missing_s[:3],
+        )
+    if unexpected_s:
+        logger.warning(
+            "External checkpoint: %d unexpected keys in student backbone (e.g. %s)",
+            len(unexpected_s),
+            unexpected_s[:3],
+        )
+    logger.info(
+        "External checkpoint loaded into student and teacher backbones "
+        "(%d keys matched).",
+        len(sd) - len(missing_s),
+    )
+
+
 def _freeze_student_backbone_except_last_n(cfg, model):
     n_unfrozen = cfg.train.unfreeze_last_n_blocks
     student_backbone = model.student.backbone
@@ -1262,9 +1341,12 @@ def main(args):
     cfg = setup(args)
     print(cfg)
     model = SSLMetaArch(cfg).to(torch.device("cuda"))
-    #Load model here from pretrained.
     if cfg.train.use_pretrained:
+        # Load Meta's released DINOv2 weights via torch.hub
         _load_pretrained_backbone(cfg, model)
+    elif getattr(cfg.train, "pretrained_weights", ""):
+        # Load from an external checkpoint (local teacher ckpt, DINOv3 backbone, etc.)
+        _load_from_external_checkpoint(cfg, model)
     _freeze_student_backbone_except_last_n(cfg, model)
 
     model.prepare_for_distributed_training()
