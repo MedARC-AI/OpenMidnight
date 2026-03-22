@@ -290,6 +290,45 @@ def _load_pretrained_backbone(cfg, model):
         student_backbone.norm.bias.copy_(model_pretrained.norm.bias)
 
 
+def _load_from_teacher_checkpoint(cfg, model):
+    """
+    Initialise student and teacher backbones from a teacher_checkpoint.pth produced
+    by do_test().  The file has the structure {"teacher": model.teacher.state_dict()},
+    where keys look like "backbone.patch_embed.proj.weight" (FSDP "module." prefix
+    already stripped by do_test).  This is used to start high-resolution fine-tuning
+    from a checkpoint of the standard-resolution training stage.
+    """
+    ckpt_path = cfg.train.pretrained_weights
+    logger.info("Loading backbone from teacher checkpoint: %s", ckpt_path)
+    state = torch.load(ckpt_path, map_location="cpu")
+
+    # teacher_checkpoint.pth is saved as {"teacher": <state_dict>}
+    teacher_sd = state.get("teacher", state)
+
+    # Strip any residual FSDP "module." prefix
+    teacher_sd = {k.replace("module.", ""): v for k, v in teacher_sd.items()}
+
+    # Keep only backbone keys, then strip the "backbone." prefix
+    backbone_sd = {
+        k[len("backbone."):]: v
+        for k, v in teacher_sd.items()
+        if k.startswith("backbone.")
+    }
+
+    with torch.no_grad():
+        missing, unexpected = model.student.backbone.load_state_dict(backbone_sd, strict=False)
+        if missing:
+            logger.warning("Missing keys loading pretrained backbone (student): %s", missing)
+        if unexpected:
+            logger.warning("Unexpected keys loading pretrained backbone (student): %s", unexpected)
+
+        # teacher will be synced from student in prepare_for_distributed_training(),
+        # but copy explicitly here too for clarity
+        model.teacher.backbone.load_state_dict(backbone_sd, strict=False)
+
+    logger.info("Loaded backbone weights from %s", ckpt_path)
+
+
 def _freeze_student_backbone_except_last_n(cfg, model):
     n_unfrozen = cfg.train.unfreeze_last_n_blocks
     student_backbone = model.student.backbone
@@ -391,8 +430,9 @@ def do_test(cfg, model, iteration): # save teacher checkpoint (used for eval onl
             ]
             super().__init__(ops)
 
+    eval_size = cfg.crops.global_crops_size  # matches inference resolution (392 in high-res stage)
     transform = _ResizeAndCrop(
-        size=224,
+        size=eval_size,
         mean=[0.485, 0.456, 0.406],
         std=[0.229, 0.224, 0.225],
     )
@@ -1141,19 +1181,27 @@ def do_train(cfg, model, resume=False):
     # training loop
 
     iteration = start_iter
+    accumulation_steps = int(getattr(cfg.train, "gradient_accumulation_steps", 1))
+    if accumulation_steps < 1:
+        accumulation_steps = 1
+    if accumulation_steps > 1:
+        logger.info("Gradient accumulation enabled: %d micro-batches per optimizer step", accumulation_steps)
 
     logger.info("Starting training from iteration {}".format(start_iter))
     metrics_file = os.path.join(cfg.train.output_dir, "training_metrics.json")
     metric_logger = MetricLogger(delimiter="  ", output_file=metrics_file)
     header = "Training"
 
-    for data in metric_logger.log_every(
+    # Keep a named reference to the generator so we can call next() on it inside
+    # the loop body to fetch the additional micro-batches for gradient accumulation.
+    log_every_iter = metric_logger.log_every(
         data_loader,
         10,
         header,
         eta_target_iter + 1,
         start_iter,
-    ):
+    )
+    for data in log_every_iter:
         if iteration >= early_stop_iter:
             logger.info("Early stopping at iteration {}".format(iteration))
             if cfg.evaluation.eval_period_iterations >= 0:
@@ -1194,7 +1242,22 @@ def do_train(cfg, model, resume=False):
 
         optimizer.zero_grad(set_to_none=True)
 
-        loss_dict = model.forward_backward(data, teacher_temp=teacher_temp)
+        # First micro-batch (already fetched by the outer for-loop)
+        loss_dict = model.forward_backward(data, teacher_temp=teacher_temp, accumulation_steps=accumulation_steps)
+
+        # Remaining micro-batches (gradient accumulation)
+        for _accum in range(accumulation_steps - 1):
+            try:
+                extra_data = next(log_every_iter)
+            except StopIteration:
+                break
+            extra_loss_dict = model.forward_backward(extra_data, teacher_temp=teacher_temp, accumulation_steps=accumulation_steps)
+            for k in extra_loss_dict:
+                loss_dict[k] = loss_dict[k] + extra_loss_dict[k]
+
+        # Average the accumulated loss tensors so logging reflects per-sample values
+        if accumulation_steps > 1:
+            loss_dict = {k: v / accumulation_steps for k, v in loss_dict.items()}
 
         # clip gradients
 
@@ -1265,6 +1328,8 @@ def main(args):
     #Load model here from pretrained.
     if cfg.train.use_pretrained:
         _load_pretrained_backbone(cfg, model)
+    elif getattr(cfg.train, "pretrained_weights", ""):
+        _load_from_teacher_checkpoint(cfg, model)
     _freeze_student_backbone_except_last_n(cfg, model)
 
     model.prepare_for_distributed_training()
