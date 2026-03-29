@@ -14,6 +14,7 @@ from io import BytesIO
 from pathlib import Path
 import gc
 import contextlib
+from contextlib import ExitStack
 import glob
 
 from fvcore.common.checkpoint import PeriodicCheckpointer
@@ -1249,7 +1250,14 @@ def do_train(cfg, model, resume=False):
         if micro_step % accum_steps == 0:
             optimizer.zero_grad(set_to_none=True)
 
-        loss_dict = model.forward_backward(data, teacher_temp=teacher_temp, loss_scale=loss_scale)
+        is_accumulating = (micro_step % accum_steps) != (accum_steps - 1)
+        if is_accumulating and accum_steps > 1:
+            with ExitStack() as stack:
+                for v in model.student.values():
+                    stack.enter_context(v.no_sync())
+                loss_dict = model.forward_backward(data, teacher_temp=teacher_temp, loss_scale=loss_scale)
+        else:
+            loss_dict = model.forward_backward(data, teacher_temp=teacher_temp, loss_scale=loss_scale)
 
         micro_step += 1
 
