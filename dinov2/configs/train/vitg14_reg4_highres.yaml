@@ -1,0 +1,60 @@
+dino:
+  head_n_prototypes: 131072
+  head_bottleneck_dim: 384
+  do_kde: True
+  kde_loss_weight: .05
+  koleo_loss_weight: 0
+  do_koleo: False
+ibot:
+  loss_weight: 1.0
+  mask_sample_probability: 0.5
+  mask_ratio_min_max:
+    - 0.1
+    - 0.45
+  separate_head: true
+  head_n_prototypes: 131072
+train:
+  sample_list_path: sample_dataset_highres_1M.txt  # magnification-aware: [1, 0.5, 0.25, 0.125] µm/px at 512px
+  streaming_from_hf: false
+  streaming_dataset_path: medarc/TCGA-12K-parquet
+  batch_size_per_gpu: 6
+  centering: sinkhorn_knopp
+  use_pretrained: False
+  teacher_checkpoint_path: /data/OpenMidnight_ckpts/OM_replication_interpolationfix/eval/training_45000/teacher_checkpoint.pth
+  OFFICIAL_EPOCH_LENGTH: 1250
+  num_workers: 24
+  prefetch_factor: 8
+  skip_checkpointer: false
+  gradient_accumulation_steps: 4
+  patch_size_pixels: 448
+student:
+  arch: vit_giant2
+  patch_size: 14
+  drop_path_rate: 0.4
+  ffn_layer: swiglufused
+  block_chunks: 4
+  num_register_tokens: 4
+teacher:
+  momentum_teacher: 0.994
+optim:
+  epochs: 96  # 120k iterations / 1250 steps_per_epoch = 96 epochs
+  early_stop: 96
+  weight_decay_end: 0.2
+  base_lr: 1.0e-04
+  warmup_epochs: 2
+  layerwise_decay: 1.0
+crops:
+  global_crops_scale:
+    - 0.32
+    - 1.0
+  local_crops_number: 8
+  local_crops_scale:
+    - 0.05
+    - 0.32
+  global_crops_size: 392
+  local_crops_size: 168
+evaluation:
+  eval_period_iterations: 5000
+  bach_root: /block/eva-data/bach
+  breakhis_root: /block/eva-data/breakhis
+  pcam_root: /block/eva-data/patch_camelyon

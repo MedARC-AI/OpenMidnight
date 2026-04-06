@@ -14,6 +14,7 @@ from io import BytesIO
 from pathlib import Path
 import gc
 import contextlib
+from contextlib import ExitStack
 import glob
 
 from fvcore.common.checkpoint import PeriodicCheckpointer
@@ -290,6 +291,53 @@ def _load_pretrained_backbone(cfg, model):
         student_backbone.norm.bias.copy_(model_pretrained.norm.bias)
 
 
+def _load_from_teacher_checkpoint(cfg, model):
+    ckpt_path = str(cfg.train.teacher_checkpoint_path)
+    logger.info("Loading from teacher checkpoint: %s", ckpt_path)
+    state = torch.load(ckpt_path, map_location="cpu")["teacher"]
+    state = {k.replace("module.", ""): v for k, v in state.items()}
+
+    backbone_state = {k.replace("backbone.", ""): v for k, v in state.items() if k.startswith("backbone.")}
+    dino_head_state = {k.replace("dino_head.", ""): v for k, v in state.items() if k.startswith("dino_head.")}
+    ibot_head_state = {k.replace("ibot_head.", ""): v for k, v in state.items() if k.startswith("ibot_head.")}
+
+    student_backbone = model.student.backbone
+    teacher_backbone = model.teacher.backbone
+
+    # Interpolate position embeddings if resolution changed
+    pos_embed = backbone_state["pos_embed"]
+    n_extra_tokens = 1
+    cls_pos = pos_embed[:, :n_extra_tokens]
+    patch_pos = pos_embed[:, n_extra_tokens:]
+    orig_size = int(patch_pos.shape[1] ** 0.5)
+    target_h, target_w = student_backbone.patch_embed.patches_resolution
+
+    if orig_size != target_h or orig_size != target_w:
+        logger.info("Interpolating pos_embed from %dx%d to %dx%d", orig_size, orig_size, target_h, target_w)
+        patch_pos = patch_pos.reshape(1, orig_size, orig_size, -1).permute(0, 3, 1, 2)
+        patch_pos = F.interpolate(patch_pos, size=(target_h, target_w), mode="bicubic", align_corners=False)
+        patch_pos = patch_pos.permute(0, 2, 3, 1).reshape(1, target_h * target_w, -1)
+        backbone_state["pos_embed"] = torch.cat((cls_pos, patch_pos), dim=1)
+
+    with torch.no_grad():
+        msg = student_backbone.load_state_dict(backbone_state, strict=False)
+        logger.info("Student backbone load: %s", msg)
+        msg = teacher_backbone.load_state_dict(backbone_state, strict=False)
+        logger.info("Teacher backbone load: %s", msg)
+
+        if dino_head_state:
+            msg = model.student.dino_head.load_state_dict(dino_head_state, strict=False)
+            logger.info("Student dino_head load: %s", msg)
+            msg = model.teacher.dino_head.load_state_dict(dino_head_state, strict=False)
+            logger.info("Teacher dino_head load: %s", msg)
+
+        if ibot_head_state:
+            msg = model.student.ibot_head.load_state_dict(ibot_head_state, strict=False)
+            logger.info("Student ibot_head load: %s", msg)
+            msg = model.teacher.ibot_head.load_state_dict(ibot_head_state, strict=False)
+            logger.info("Teacher ibot_head load: %s", msg)
+
+
 def _freeze_student_backbone_except_last_n(cfg, model):
     n_unfrozen = cfg.train.unfreeze_last_n_blocks
     student_backbone = model.student.backbone
@@ -391,8 +439,9 @@ def do_test(cfg, model, iteration): # save teacher checkpoint (used for eval onl
             ]
             super().__init__(ops)
 
+    eval_size = cfg.crops.global_crops_size
     transform = _ResizeAndCrop(
-        size=224,
+        size=eval_size,
         mean=[0.485, 0.456, 0.406],
         std=[0.229, 0.224, 0.225],
     )
@@ -1119,7 +1168,8 @@ def do_train(cfg, model, resume=False):
         sample_list_path = str(cfg.train.sample_list_path)
         if not sample_list_path:
             raise ValueError("cfg.train.sample_list_path must be set when streaming_from_hf is False")
-        dataset_str = f"pathology:root=/data/TCGA/:sample_list_path={sample_list_path}"
+        patch_size_pixels = getattr(cfg.train, 'patch_size_pixels', 224)
+        dataset_str = f"pathology:root=/data/TCGA/:sample_list_path={sample_list_path}:patch_size_pixels={patch_size_pixels}"
         dataset = make_dataset(
             dataset_str=dataset_str,
             transform=data_transform,
@@ -1141,11 +1191,16 @@ def do_train(cfg, model, resume=False):
     # training loop
 
     iteration = start_iter
+    accum_steps = getattr(cfg.train, 'gradient_accumulation_steps', 1)
+    loss_scale = 1.0 / accum_steps
 
     logger.info("Starting training from iteration {}".format(start_iter))
+    logger.info("Gradient accumulation steps: %d (loss_scale=%.4f)", accum_steps, loss_scale)
     metrics_file = os.path.join(cfg.train.output_dir, "training_metrics.json")
     metric_logger = MetricLogger(delimiter="  ", output_file=metrics_file)
     header = "Training"
+
+    micro_step = 0
 
     for data in metric_logger.log_every(
         data_loader,
@@ -1192,9 +1247,23 @@ def do_train(cfg, model, resume=False):
 
         # compute losses
 
-        optimizer.zero_grad(set_to_none=True)
+        if micro_step % accum_steps == 0:
+            optimizer.zero_grad(set_to_none=True)
 
-        loss_dict = model.forward_backward(data, teacher_temp=teacher_temp)
+        is_accumulating = (micro_step % accum_steps) != (accum_steps - 1)
+        if is_accumulating and accum_steps > 1:
+            with ExitStack() as stack:
+                for v in model.student.values():
+                    stack.enter_context(v.no_sync())
+                loss_dict = model.forward_backward(data, teacher_temp=teacher_temp, loss_scale=loss_scale)
+        else:
+            loss_dict = model.forward_backward(data, teacher_temp=teacher_temp, loss_scale=loss_scale)
+
+        micro_step += 1
+
+        # only step optimizer and update teacher after accumulation
+        if micro_step % accum_steps != 0:
+            continue
 
         # clip gradients
 
@@ -1263,7 +1332,10 @@ def main(args):
     print(cfg)
     model = SSLMetaArch(cfg).to(torch.device("cuda"))
     #Load model here from pretrained.
-    if cfg.train.use_pretrained:
+    teacher_ckpt = getattr(cfg.train, 'teacher_checkpoint_path', '')
+    if teacher_ckpt:
+        _load_from_teacher_checkpoint(cfg, model)
+    elif cfg.train.use_pretrained:
         _load_pretrained_backbone(cfg, model)
     _freeze_student_backbone_except_last_n(cfg, model)
 
