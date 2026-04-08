@@ -1,0 +1,79 @@
+# ViT-G/14 fine-tuning with the DINOv3-style GRAM (patch-similarity) loss.
+#
+# The Gram loss (dinov2/loss/gram_loss.py) adds an MSE term that enforces the
+# student to reproduce the pairwise cosine-similarity structure of the teacher's
+# patch tokens.  This is the key new objective introduced in DINOv3 / path-fm.
+#
+# In this config we use "EMA teacher mode": the existing EMA teacher's patch
+# tokens are used directly as Gram targets — no separate frozen model is needed.
+#
+# Key differences vs. vitg14_reg4.yaml (standard DINOv2 fine-tuning):
+#
+#   gram.use_loss: true       — enables the Gram MSE loss
+#   gram.loss_weight: 0.1     — conservative starting weight; increase toward
+#                               1.0 if loss curves remain stable
+#   gram.img_level: true      — per-image Gram (B×N×N) rather than batch-level;
+#                               more memory-efficient and matches DINOv3 defaults
+#   gram.normalized: true     — L2-normalise before Gram (cosine similarity)
+#
+# All other settings are identical to vitg14_reg4.yaml so you can do a clean
+# ablation: the only variable is the addition of the Gram loss term.
+#
+# Launch with run_gram.sh.
+dino:
+  head_n_prototypes: 131072
+  head_bottleneck_dim: 384
+  do_kde: True
+  kde_loss_weight: .05
+  koleo_loss_weight: 0
+  do_koleo: False
+ibot:
+  loss_weight: 1.0
+  mask_sample_probability: 0.5
+  mask_ratio_min_max:
+    - 0.1
+    - 0.45
+  separate_head: true
+  head_n_prototypes: 131072
+gram:
+  use_loss: true                # ← enable Gram (patch-similarity) loss
+  img_level: true               # per-image Gram matrices
+  loss_weight: 0.1              # tune up to ~1.0 if training is stable
+  normalized: true              # L2-normalise patch features before Gram
+  remove_neg: false
+  remove_only_teacher_neg: false
+train:
+  sample_list_path: /block/TCGA/sample_dataset_30.txt
+  streaming_from_hf: false
+  streaming_dataset_path: medarc/TCGA-12K-parquet
+  batch_size_per_gpu: 48
+  centering: sinkhorn_knopp
+  use_pretrained: True          # start from Meta's DINOv2 weights (same as baseline)
+  pretrained_weights: ''
+  OFFICIAL_EPOCH_LENGTH: 1250
+  num_workers: 24
+  prefetch_factor: 8
+  skip_checkpointer: true
+student:
+  arch: vit_giant2
+  patch_size: 14
+  drop_path_rate: 0.4
+  ffn_layer: swiglufused
+  block_chunks: 4
+  num_register_tokens: 4
+teacher:
+  momentum_teacher: 0.994
+optim:
+  epochs: 200
+  early_stop: 200
+  weight_decay_end: 0.2
+  base_lr: 2.0e-04
+  warmup_epochs: 10
+  layerwise_decay: 1.0
+crops:
+  local_crops_size: 98
+evaluation:
+  eval_period_iterations: 5000
+  bach_root: /block/eva-data/bach
+  breakhis_root: /block/eva-data/breakhis
+  pcam_root: /block/eva-data/patch_camelyon

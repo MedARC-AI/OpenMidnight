@@ -9,7 +9,7 @@ import logging
 import torch
 from torch import nn
 
-from dinov2.loss import DINOLoss, iBOTPatchLoss, KoLeoLoss, KDELoss
+from dinov2.loss import DINOLoss, iBOTPatchLoss, KoLeoLoss, KDELoss, GramLoss
 from dinov2.models import build_model_from_cfg
 from dinov2.layers import DINOHead
 from dinov2.utils.utils import has_batchnorms
@@ -113,6 +113,20 @@ class SSLMetaArch(nn.Module):
                 teacher_model_dict["ibot_head"] = ibot_head()
             else:
                 logger.info("OPTIONS -- IBOT -- head shared with DINO")
+
+        # ── Gram (patch-similarity) loss — DINOv3-style ───────────────────────
+        gram_cfg = getattr(cfg, "gram", None)
+        self.do_gram = gram_cfg is not None and getattr(gram_cfg, "use_loss", False)
+        if self.do_gram:
+            logger.info("OPTIONS -- GRAM loss enabled (EMA teacher mode)")
+            logger.info(f"OPTIONS -- GRAM -- loss_weight: {gram_cfg.loss_weight}")
+            logger.info(f"OPTIONS -- GRAM -- img_level: {gram_cfg.img_level}")
+            logger.info(f"OPTIONS -- GRAM -- normalized: {gram_cfg.normalized}")
+            self.gram_loss_fn = GramLoss(
+                apply_norm=gram_cfg.normalized,
+                remove_neg=gram_cfg.remove_neg,
+                remove_only_teacher_neg=gram_cfg.remove_only_teacher_neg,
+            )
 
         self.need_to_synchronize_fsdp_streams = True
 
@@ -228,9 +242,21 @@ class SSLMetaArch(nn.Module):
             else:
                 raise NotImplementedError
 
-            return teacher_dino_softmaxed_centered_list, masked_teacher_ibot_softmaxed_centered
+            # Return raw patch tokens so the Gram loss can use them when enabled.
+            # When do_gram is False this tensor is simply ignored by the caller.
+            gram_teacher_patch_tokens = ibot_teacher_patch_tokens if self.do_gram else None
 
-        teacher_dino_softmaxed_centered_list, masked_teacher_ibot_softmaxed_centered = get_teacher_output()
+            return (
+                teacher_dino_softmaxed_centered_list,
+                masked_teacher_ibot_softmaxed_centered,
+                gram_teacher_patch_tokens,
+            )
+
+        (
+            teacher_dino_softmaxed_centered_list,
+            masked_teacher_ibot_softmaxed_centered,
+            gram_teacher_patch_tokens,
+        ) = get_teacher_output()
         reshard_fsdp_model(self.teacher)
 
         loss_dict = {}
@@ -354,6 +380,21 @@ class SSLMetaArch(nn.Module):
 
             # accumulate loss
             loss_accumulator += self.ibot_loss_weight * ibot_patch_loss
+
+        # ── Gram (patch-similarity) loss ─────────────────────────────────────
+        if self.do_gram:
+            gram_cfg = self.cfg.gram
+            # Use full (unmasked) global crop patch tokens from both student and teacher.
+            # Teacher tokens come from get_teacher_output() under @no_grad so they
+            # already have requires_grad=False.
+            student_patch_tokens = student_global_backbone_output_dict["x_norm_patchtokens"]
+            gram_loss_val = gram_cfg.loss_weight * self.gram_loss_fn(
+                student_patch_tokens,
+                gram_teacher_patch_tokens,
+                img_level=gram_cfg.img_level,
+            )
+            loss_accumulator += gram_loss_val
+            loss_dict["gram_loss"] = gram_loss_val.detach()
 
         self.backprop_loss(loss_accumulator)
 

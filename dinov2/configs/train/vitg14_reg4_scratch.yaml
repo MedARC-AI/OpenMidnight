@@ -1,0 +1,66 @@
+# ViT-G/14 trained FROM SCRATCH (no pretrained starting point).
+#
+# Key differences vs. vitg14_reg4.yaml (DINOv2-pretrained fine-tuning):
+#
+#   use_pretrained: False     — random initialisation; no torch.hub download
+#   base_lr: 1.5e-03          — ~7.5× higher LR; from-scratch needs a larger
+#                               signal to escape random init (DINOv2 paper uses
+#                               2e-3 for ViT-g at batch 3072; we scale down
+#                               proportionally for our smaller effective batch)
+#   warmup_epochs: 20         — 2× longer warmup for stable early training
+#   layerwise_decay: 0.9      — standard LLRD (vs 1.0 for fine-tuning) lets
+#                               lower backbone layers learn more conservatively
+#   epochs / early_stop: 200  — same wall-time as the pretrained run; you may
+#                               want to increase this for a full from-scratch run
+#
+# Launch with run_scratch.sh.
+dino:
+  head_n_prototypes: 131072
+  head_bottleneck_dim: 384
+  do_kde: True
+  kde_loss_weight: .05
+  koleo_loss_weight: 0
+  do_koleo: False
+ibot:
+  loss_weight: 1.0
+  mask_sample_probability: 0.5
+  mask_ratio_min_max:
+    - 0.1
+    - 0.45
+  separate_head: true
+  head_n_prototypes: 131072
+train:
+  sample_list_path: /block/TCGA/sample_dataset_30.txt
+  streaming_from_hf: false
+  streaming_dataset_path: medarc/TCGA-12K-parquet
+  batch_size_per_gpu: 48
+  centering: sinkhorn_knopp
+  use_pretrained: False         # ← key: train from random initialisation
+  pretrained_weights: ''        # empty → no external checkpoint either
+  OFFICIAL_EPOCH_LENGTH: 1250
+  num_workers: 24
+  prefetch_factor: 8
+  skip_checkpointer: true
+student:
+  arch: vit_giant2
+  patch_size: 14
+  drop_path_rate: 0.4
+  ffn_layer: swiglufused
+  block_chunks: 4
+  num_register_tokens: 4
+teacher:
+  momentum_teacher: 0.994
+optim:
+  epochs: 200
+  early_stop: 200
+  weight_decay_end: 0.2
+  base_lr: 1.5e-03              # ← tuned for from-scratch (≈7.5× fine-tuning LR)
+  warmup_epochs: 20             # ← longer warmup for random-init stability
+  layerwise_decay: 0.9          # ← standard LLRD (fine-tuning uses 1.0)
+crops:
+  local_crops_size: 98
+evaluation:
+  eval_period_iterations: 5000
+  bach_root: /block/eva-data/bach
+  breakhis_root: /block/eva-data/breakhis
+  pcam_root: /block/eva-data/patch_camelyon
