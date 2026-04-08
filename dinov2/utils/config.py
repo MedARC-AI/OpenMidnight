@@ -22,8 +22,12 @@ def apply_scaling_rules_to_cfg(cfg):  # to fix
     if cfg.optim.scaling_rule == "sqrt_wrt_1024":
         base_lr = cfg.optim.base_lr
         cfg.optim.lr = base_lr
-        cfg.optim.lr *= math.sqrt(cfg.train.batch_size_per_gpu * distributed.get_global_size() / 1024.0)
-        logger.info(f"sqrt scaling learning rate; base: {base_lr}, new: {cfg.optim.lr}")
+        # Use the effective batch size (micro-batch × GPUs × accumulation steps) so
+        # that gradient accumulation doesn't artificially shrink the learning rate.
+        accum = int(getattr(cfg.train, "gradient_accumulation_steps", 1))
+        effective_batch = cfg.train.batch_size_per_gpu * distributed.get_global_size() * accum
+        cfg.optim.lr *= math.sqrt(effective_batch / 1024.0)
+        logger.info(f"sqrt scaling learning rate; base: {base_lr}, effective_batch: {effective_batch}, new: {cfg.optim.lr}")
     else:
         raise NotImplementedError
     return cfg

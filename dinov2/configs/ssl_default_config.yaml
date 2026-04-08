@@ -70,6 +70,8 @@ train:
   cache_dataset: true
   centering: "centering" # or "sinkhorn_knopp"
   unfreeze_last_n_blocks: 40
+  gradient_accumulation_steps: 1  # micro-batches per optimizer step; >1 enables grad accumulation
+  pretrained_weights: ''  # path to a teacher_checkpoint.pth from a prior training run
 student:
   arch: vit_large
   patch_size: 16

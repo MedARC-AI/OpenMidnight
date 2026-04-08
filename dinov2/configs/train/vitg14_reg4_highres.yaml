@@ -1,0 +1,107 @@
+# High-resolution fine-tuning stage — as described in the Midnight paper (Section 2).
+#
+# This config is designed to be run AFTER standard-resolution training
+# (vitg14_reg4.yaml).  It fine-tunes the model at 392×392 global crops for
+# 120 000 optimizer steps (~96 epochs), matching the Midnight-92k/392 recipe.
+#
+# Key differences from vitg14_reg4.yaml:
+#   crops.global_crops_size : 224  →  392
+#   crops.local_crops_size  : 98   →  168
+#   train.batch_size_per_gpu: 48   →  16  (392px uses ~3× more GPU memory)
+#   gradient_accumulation_steps: 1 →  3   (effective batch stays 16×8×3 = 384)
+#   optim.base_lr           : 2e-4 →  1e-4
+#   optim.epochs            : —    →  96  (96 × 1250 steps = 120 000 opt. steps)
+#   train.use_pretrained    : True →  False
+#   train.pretrained_weights: ""   →  set via CLI or edit below
+#   train.skip_checkpointer : true →  false  (save FSDP checkpoints for resuming)
+#
+# Usage:
+#   Set STAGE1_CHECKPOINT in run_highres.sh to point at the teacher_checkpoint.pth
+#   produced by vitg14_reg4 training (found under output_vitg14/eval/<iter>/).
+#   Then run:  bash run_highres.sh
+
+dino:
+  head_n_prototypes: 131072
+  head_bottleneck_dim: 384
+  do_kde: True
+  kde_loss_weight: .05
+  koleo_loss_weight: 0
+  do_koleo: False
+
+ibot:
+  loss_weight: 1.0
+  mask_sample_probability: 0.5
+  mask_ratio_min_max:
+    - 0.1
+    - 0.45
+  separate_head: true
+  head_n_prototypes: 131072
+
+train:
+  # ── Data ──────────────────────────────────────────────────────────────────
+  sample_list_path: /block/TCGA/sample_dataset_30.txt
+  streaming_from_hf: false
+  streaming_dataset_path: medarc/TCGA-12K-parquet
+
+  # ── Batch / accumulation ──────────────────────────────────────────────────
+  # 392px global crops need ~3× the memory of 224px, so per-GPU batch is
+  # reduced from 48 to 16.  Three accumulation steps restore the effective
+  # total batch size to 16 × 8 GPUs × 3 = 384.
+  batch_size_per_gpu: 16
+  gradient_accumulation_steps: 3
+
+  # ── Initialisation ────────────────────────────────────────────────────────
+  # Do NOT reload Meta's DINOv2 backbone; load from our own stage-1 checkpoint.
+  # Set pretrained_weights here OR pass it as a CLI override:
+  #   train.pretrained_weights=/path/to/teacher_checkpoint.pth
+  use_pretrained: False
+  pretrained_weights: ""
+
+  # ── Checkpointing ─────────────────────────────────────────────────────────
+  # Enable so that this stage can be interrupted and resumed.
+  skip_checkpointer: false
+
+  # ── Misc ──────────────────────────────────────────────────────────────────
+  centering: sinkhorn_knopp
+  OFFICIAL_EPOCH_LENGTH: 1250
+  num_workers: 24
+  prefetch_factor: 8
+
+student:
+  arch: vit_giant2
+  patch_size: 14
+  drop_path_rate: 0.4
+  ffn_layer: swiglufused
+  block_chunks: 4
+  num_register_tokens: 4
+
+teacher:
+  momentum_teacher: 0.994
+
+optim:
+  # 96 epochs × 1250 steps/epoch = 120 000 optimizer steps (matches paper)
+  epochs: 96
+  early_stop: 96
+  # Reduced LR for the fine-tuning stage (paper: 1e-4)
+  base_lr: 1.0e-04
+  warmup_epochs: 5
+  weight_decay_end: 0.2
+  layerwise_decay: 1.0
+
+crops:
+  # ── Resolution increase (core change for high-res stage) ─────────────────
+  global_crops_size: 392    # was 224; (392/14)^2 = 784 patch tokens per image
+  local_crops_size: 168     # was 98
+  global_crops_scale:
+    - 0.32
+    - 1.0
+  local_crops_scale:
+    - 0.05
+    - 0.32
+  local_crops_number: 8
+
+evaluation:
+  eval_period_iterations: 5000
+  bach_root: /block/eva-data/bach
+  breakhis_root: /block/eva-data/breakhis
+  pcam_root: /block/eva-data/patch_camelyon
