@@ -1013,6 +1013,7 @@ def do_train(cfg, model, resume=False):
         cfg.crops.local_crops_number,
         global_crops_size=cfg.crops.global_crops_size,
         local_crops_size=cfg.crops.local_crops_size,
+        ablation_mode=getattr(cfg.crops, "ablation_mode", "baseline"),
     )
 
     collate_fn = partial(
