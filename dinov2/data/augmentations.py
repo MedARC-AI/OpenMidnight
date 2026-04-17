@@ -14,6 +14,8 @@ from skimage import color as skimage_color
 from skimage.color import rgb2hed, hed2rgb
 from einops import rearrange
 from PIL import Image
+from turbojpeg import TurboJPEG, TJPF_RGB
+
 
 from .transforms import (
     GaussianBlur,
@@ -241,13 +243,18 @@ class ElasticDeformation(torch.nn.Module):
         return distorted
 
 
-class JpegCompression(torch.nn.Module):
-
-    def __init__(self, quality_lower=20, quality_upper=100, probability=0.5):
+class JpegCompressionTurbo(torch.nn.Module):
+    def __init__(self, quality_lower=5, quality_upper=100, probability=0.5):
         super().__init__()
         self.quality_lower = quality_lower
         self.quality_upper = quality_upper
         self.probability = probability
+        
+        # Initialize the C-engine once to avoid overhead during loops
+        try:
+            self.jpeg = TurboJPEG()
+        except Exception as e:
+            raise RuntimeError("TurboJPEG library not found. Run: sudo apt-get install libturbojpeg0-dev") from e
 
     def forward(self, img):
         if random.random() > self.probability:
@@ -257,33 +264,26 @@ class JpegCompression(torch.nn.Module):
 
         was_pil = False
         was_tensor = False
-
+        
         if isinstance(img, Image.Image):
             img_np = np.array(img)
             was_pil = True
         elif isinstance(img, torch.Tensor):
-            img_np = (img.permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+            img_np = (img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
             was_tensor = True
         else:
             img_np = img
 
-        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+        encoded_buffer = self.jpeg.encode(img_np, quality=quality, pixel_format=TJPF_RGB)
 
-        encode_param =[int(cv2.IMWRITE_JPEG_QUALITY), quality]
-        result, encimg = cv2.imencode('.jpg', img_bgr, encode_param)
-
-        if result:
-            decimg = cv2.imdecode(encimg, 1)
-            img_rgb = cv2.cvtColor(decimg, cv2.COLOR_BGR2RGB)
-        else:
-            img_rgb = img_np
+        decoded_np = self.jpeg.decode(encoded_buffer, pixel_format=TJPF_RGB)
 
         if was_pil:
-            return Image.fromarray(img_rgb)
+            return Image.fromarray(decoded_np)
         elif was_tensor:
-            return torch.from_numpy(img_rgb).permute(2, 0, 1).float() / 255.0
-
-        return img_rgb
+            return torch.from_numpy(decoded_np).permute(2, 0, 1).float() / 255.0
+        
+        return decoded_np
 
 class hed_mod(torch.nn.Module):
     """
@@ -522,9 +522,9 @@ class DataAugmentationDINO(object):
             if gb_params is not None:
                 k, s_min, s_max = gb_params
                 pipeline.append(transforms.RandomApply([transforms.GaussianBlur(kernel_size=k, sigma=(s_min, s_max))], p=blur_probability))
-                
+                            
             if use_jpeg:
-                pipeline.append(JpegCompression(probability=0.5))
+                pipeline.append(JpegCompressionTurbo(quality_lower=5, quality_upper=100, probability=0.5))
                 
             pipeline.extend([
                 transforms.ToTensor(),
