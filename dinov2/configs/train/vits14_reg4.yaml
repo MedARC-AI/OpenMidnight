@@ -7,12 +7,12 @@ dino:
   do_koleo: False
 ibot:
   loss_weight: 1.0
-  mask_sample_probability: 0.5 
+  mask_sample_probability: 0.5
   mask_ratio_min_max:
-    - 0.1 
-    - 0.45 
+    - 0.1
+    - 0.45
   separate_head: true
-  head_n_prototypes: 131072 
+  head_n_prototypes: 131072
 train:
   sample_list_path: /block/TCGA/sample_dataset_30.txt # gives paths to svs files for data loading if streaming_from_hf=False
   streaming_from_hf: false # if True, dataset is streamed from HuggingFace Hub, and sample_list_path is ignored. You should lower num_workers to 4
@@ -25,9 +25,9 @@ train:
   prefetch_factor: 8
   skip_checkpointer: true # set True if you don't need to resume training (this yields training speedup and less space usage)
 student:
-  arch: vit_giant2
+  arch: vit_small
   patch_size: 14
-  drop_path_rate: 0.4
+  drop_path_rate: 0.1 # drop path rate for vit_small
   ffn_layer: swiglufused
   block_chunks: 4
   num_register_tokens: 4
@@ -39,7 +39,7 @@ optim:
   epochs: 110 # epochs and early_stop for 137.5k pretraining steps
   early_stop: 110
   weight_decay_end: 0.2
-  base_lr: 3.0e-04  # learning rate for vit_giant2
+  base_lr: 7.0e-04 # learning rate for vit_small
   warmup_epochs: 10
   layerwise_decay: 1.0
 crops:
