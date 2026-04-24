@@ -38,15 +38,18 @@ class SlideDataset(ExtendedVisionDataset):
         read_size = int(parts[4]) if len(parts) >= 5 else self.patch_size_pixels
 
         slide = OpenSlide(path)
-        patch = slide.read_region((x, y), level=level, size=(read_size, read_size))
-        res = patch.convert("RGB")
-        if read_size != self.patch_size_pixels:
-            res = res.resize((self.patch_size_pixels, self.patch_size_pixels), Image.BICUBIC)
+        try:
+            patch = slide.read_region((x, y), level=level, size=(read_size, read_size))
+            res = patch.convert("RGB")
+            if read_size != self.patch_size_pixels:
+                res = res.resize((self.patch_size_pixels, self.patch_size_pixels), Image.BICUBIC)
 
-        if self.transforms is not None:
-            return self.transforms(res, None), index
+            if self.transforms is not None:
+                return self.transforms(res, None), index
 
-        return res, None, index
+            return res, None, index
+        finally:
+            slide.close()
 
     def hsv(self, tile_rgb, patch_size):
         tile = np.array(tile_rgb)

@@ -43,9 +43,6 @@ import pyarrow.dataset
 import torch.distributed as dist
 import torch.nn.functional as F
 
-import pyarrow
-import pyarrow.dataset
-import torch.distributed as dist
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
     StateDictType,
@@ -1233,7 +1230,7 @@ def do_train(cfg, model, resume=False):
         nan_mask2 = torch.isnan(data["collated_local_crops"])
         if nan_mask.any():
             print("found nan in input data")
-            print(data[indexes])
+            print(data["indexes"])
         
 
         # apply schedules
