@@ -8,18 +8,20 @@ from pathlib import Path
 from openslide import OpenSlide
 import numpy as np
 import cv2
+from PIL import Image
 
 class SlideDataset(ExtendedVisionDataset):
-    def __init__(self, root, sample_list_path, *args, **kwargs) -> None:
+    def __init__(self, root, sample_list_path, *args, patch_size_pixels=224, **kwargs) -> None:
         super().__init__(root, *args, **kwargs)
         self.sample_list_path = Path(sample_list_path)
+        self.patch_size_pixels = patch_size_pixels
         if not self.sample_list_path.is_file():
             raise FileNotFoundError(f"Sample list not found at {self.sample_list_path}")
 
         with self.sample_list_path.open("r") as f:
             self.image_files = [line.strip() for line in f if line.strip()]
 
-        print(f"This many resolved paths {len(self.image_files)} from {self.sample_list_path}")
+        print(f"This many resolved paths {len(self.image_files)} from {self.sample_list_path} (patch_size={patch_size_pixels})")
 
     def get_all(self, index):
         parts = self.image_files[index].split(" ")
@@ -28,33 +30,32 @@ class SlideDataset(ExtendedVisionDataset):
         return image, path
 
     def __getitem__(self, index: int) -> Tuple[Any, Any]:
-        path = self.image_files[index]
-        parts = path.split(" ")
-        path, x, y, level = parts
-        x = int(x)
-        y = int(y)
-        level = int(level)
+        parts = self.image_files[index].split(" ")
+        path = parts[0]
+        x = int(parts[1])
+        y = int(parts[2])
+        level = int(parts[3])
+        read_size = int(parts[4]) if len(parts) >= 5 else self.patch_size_pixels
 
-        image = OpenSlide(path)
+        slide = OpenSlide(path)
+        try:
+            patch = slide.read_region((x, y), level=level, size=(read_size, read_size))
+            res = patch.convert("RGB")
+            if read_size != self.patch_size_pixels:
+                res = res.resize((self.patch_size_pixels, self.patch_size_pixels), Image.BICUBIC)
 
-        patch_size = 224
-        height = image.level_dimensions[0][1]
-        width = image.level_dimensions[0][0]
+            if self.transforms is not None:
+                return self.transforms(res, None), index
 
-        #read_region is based on the top left pixel in the level 0, not our current level
-        patch = image.read_region((x, y), level=level, size=(patch_size, patch_size))
+            return res, None, index
+        finally:
+            slide.close()
 
-        res = patch.convert("RGB") # Removes alpha - not sure this is the best way to do this thuogh
-        if self.transforms is not None:
-            return self.transforms(res, None), index
-
-        return res, None, index
-        
     def hsv(self, tile_rgb, patch_size):
         tile = np.array(tile_rgb)
         tile = cv2.cvtColor(tile, cv2.COLOR_RGB2HSV)
         min_ratio = .6
-        
+
         lower_bound = np.array([90, 8, 103])
         upper_bound = np.array([180, 255, 255])
 
