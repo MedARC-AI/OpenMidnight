@@ -2,12 +2,13 @@
 # This source code is licensed under the Apache License, Version 2.0
 # found in the LICENSE file in the root directory of this source tree.
 
-from typing import Any, Tuple
+from typing import Any, Optional, Tuple
 from .extended import ExtendedVisionDataset
 from pathlib import Path
 from openslide import OpenSlide
 import numpy as np
 import cv2
+import random
 
 class SlideDataset(ExtendedVisionDataset):
     def __init__(self, root, sample_list_path, *args, **kwargs) -> None:
@@ -50,20 +51,40 @@ class SlideDataset(ExtendedVisionDataset):
 
         return res, None, index
         
-    def hsv(self, tile_rgb, patch_size):
+    def hsv(self, tile_rgb, patch_size) -> Optional[Any]:
+        """Filter patches using probabilistic HSV-based tissue detection.
+
+        Instead of a hard accept/reject threshold, patches with a tissue ratio
+        between ``low_ratio`` and ``high_ratio`` are accepted with probability
+        equal to their ratio.  This biases the dataset toward informative
+        patches while still allowing occasional lighter/borderline tiles
+        through, rather than discarding them entirely.
+
+        Acceptance rules:
+          ratio >= high_ratio  → always accept  (p = 1.0)
+          low_ratio <= ratio < high_ratio → accept with p = ratio
+          ratio < low_ratio    → always reject  (p = 0.0)
+        """
+        low_ratio = 0.10
+        high_ratio = 0.60
+
         tile = np.array(tile_rgb)
         tile = cv2.cvtColor(tile, cv2.COLOR_RGB2HSV)
-        min_ratio = .6
-        
+
         lower_bound = np.array([90, 8, 103])
         upper_bound = np.array([180, 255, 255])
 
         mask = cv2.inRange(tile, lower_bound, upper_bound)
-
         ratio = np.count_nonzero(mask) / mask.size
-        if ratio > min_ratio:
+
+        if ratio >= high_ratio:
             return tile_rgb
-        else: # ratio failed, reject
+        elif ratio >= low_ratio:
+            # Probabilistic acceptance: p = ratio
+            if random.random() < ratio:
+                return tile_rgb
+            return None
+        else:
             return None
 
     def __len__(self) -> int:
