@@ -41,6 +41,8 @@ dependencies = [
     "timm>=1.0.9",
     # for HEST benchmarking:
     "hestcore==1.0.4",
+ # μP: automatic learning-rate scaling across model widths (issue #41)
+ "mup>=1.0.0",
 ]
 
 [tool.setuptools.packages.find]

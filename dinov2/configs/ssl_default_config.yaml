@@ -106,6 +106,7 @@ optim:
   layerwise_decay: 0.9
   adamw_beta1: 0.9
   adamw_beta2: 0.999
+  use_mup: false  # set true to enable μP LR scaling (github.com/microsoft/mup)
 crops:
   global_crops_scale:
   - 0.32

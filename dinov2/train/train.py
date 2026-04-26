@@ -127,6 +127,23 @@ For python-based LazyConfig, use "path.key=value".
 
 
 def build_optimizer(cfg, params_groups):
+    if cfg.optim.get("use_mup", False):
+        # Use MuAdamW from the mup library so that each parameter's LR is
+        # automatically divided by its infshape.width_mult().
+        # MuAdamW splits every param into its own group and scales lr;
+        # we capture that scale as `mup_lr_scale` so apply_optim_scheduler
+        # can multiply it back in each step without overwriting the width scaling.
+        from mup import MuAdamW
+        optimizer = MuAdamW(
+            params_groups,
+            lr=1.0,  # placeholder; apply_optim_scheduler sets the real value
+            betas=(cfg.optim.adamw_beta1, cfg.optim.adamw_beta2),
+        )
+        # MuAdamW sets pg["lr"] = 1.0 / width_mult() for each refined group.
+        # Store it so apply_optim_scheduler can multiply by it each step.
+        for pg in optimizer.param_groups:
+            pg["mup_lr_scale"] = pg["lr"]
+        return optimizer
     return torch.optim.AdamW(params_groups, betas=(cfg.optim.adamw_beta1, cfg.optim.adamw_beta2))
 
 
@@ -183,8 +200,13 @@ def apply_optim_scheduler(optimizer, lr, wd, last_layer_lr):
         is_last_layer = param_group["is_last_layer"]
         lr_multiplier = param_group["lr_multiplier"]
         wd_multiplier = param_group["wd_multiplier"]
+        # mup_lr_scale is set by build_optimizer when use_mup=True.
+        # It stores the per-parameter width-based LR factor that MuAdamW
+        # computed at init time (1/width_mult()), so we can multiply it in
+        # here instead of setting lr absolutely and losing the μP scaling.
+        mup_lr_scale = param_group.get("mup_lr_scale", 1.0)
         param_group["weight_decay"] = wd * wd_multiplier
-        param_group["lr"] = (last_layer_lr if is_last_layer else lr) * lr_multiplier
+        param_group["lr"] = (last_layer_lr if is_last_layer else lr) * lr_multiplier * mup_lr_scale
 
 _FULL_STATE_DICT_CFG = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
 
@@ -1262,6 +1284,18 @@ def main(args):
     cfg = setup(args)
     print(cfg)
     model = SSLMetaArch(cfg).to(torch.device("cuda"))
+
+    # Apply μP BEFORE loading pretrained weights and BEFORE FSDP wrapping.
+    # set_base_shapes rescales the freshly-initialized parameters and attaches
+    # p.infshape to every parameter.  Because the FSDP wrapper uses
+    # use_orig_params=True the original parameter objects (and their infshape
+    # attributes) are preserved after wrapping, so MuAdamW can read them when
+    # the optimizer is built in do_train().
+    if cfg.optim.get("use_mup", False):
+        from dinov2.models.mup_utils import setup_mup
+        logger.info("μP enabled — applying set_base_shapes to student backbone")
+        setup_mup(model.student.backbone, cfg, args.output_dir)
+
     #Load model here from pretrained.
     if cfg.train.use_pretrained:
         _load_pretrained_backbone(cfg, model)
