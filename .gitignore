@@ -61,3 +61,7 @@ wsi_*.png
 !docs/*.docx
 # Local-only docs (technical report, generated artifacts)
 docs/
+
+# Local-only handoff and tracker docs (kept on disk, out of git)
+HIGHRES_FINETUNING_GUIDE.md
+HIGHRES_EXPERIMENTS.md
