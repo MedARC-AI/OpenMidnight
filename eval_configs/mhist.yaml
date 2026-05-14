@@ -37,11 +37,13 @@ trainer:
           backbone:
             class_path: eva.core.models.wrappers.ModelFromFunction
             init_args:
-              path: torch.hub.load
+              path: eva.vision.models.networks.backbones.pathology.openmidnight.openmidnight_dinov2_vitg14_reg
               arguments:
-                repo_or_dir: facebookresearch/dinov2 
-                model: dinov2_vitg14_reg 
-                pretrained: true
+                include_patch_tokens: ${oc.env:INCLUDE_PATCH_TOKENS, false}
+
+                interpolate_offset: ${oc.env:INTERPOLATE_OFFSET, 0.1}
+
+                interpolate_antialias: ${oc.env:INTERPOLATE_ANTIALIAS, false}
               checkpoint_path: ${oc.env:CHECKPOINT_PATH, ../checkpoints/teacher_epoch250000.pth}
           overwrite: true
     logger:

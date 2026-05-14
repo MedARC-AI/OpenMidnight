@@ -50,7 +50,7 @@ def _parse_dataset_str(dataset_str: str):
 
     for token in tokens[1:]:
         key, value = token.split("=")
-        assert key in ("root", "extra", "split", "sample_list_path")
+        assert key in ("root", "extra", "split", "sample_list_path", "patch_size_pixels")
         kwargs[key] = value
 
     if name == "ImageNet":
@@ -61,6 +61,8 @@ def _parse_dataset_str(dataset_str: str):
         class_ = ImageNet22k
     elif name.lower() == "pathology":
         class_ = SlideDataset
+        if "patch_size_pixels" in kwargs:
+            kwargs["patch_size_pixels"] = int(kwargs["patch_size_pixels"])
         print("kwargs", kwargs)
     else:
         raise ValueError(f'Unsupported dataset "{name}"')

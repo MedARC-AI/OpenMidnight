@@ -1,0 +1,68 @@
+dino:
+  head_n_prototypes: 131072
+  head_bottleneck_dim: 384
+  do_kde: True
+  kde_loss_weight: .05
+  koleo_loss_weight: 0
+  do_koleo: False
+ibot:
+  loss_weight: 1.0
+  mask_sample_probability: 0.5
+  mask_ratio_min_max:
+    - 0.1
+    - 0.45
+  separate_head: true
+  head_n_prototypes: 131072
+train:
+  sample_list_path: /data/rdatchane/sample_dataset_highres_25M.txt
+  streaming_from_hf: false
+  streaming_dataset_path: medarc/TCGA-12K-parquet
+  batch_size_per_gpu: 12
+  centering: sinkhorn_knopp
+  use_pretrained: False
+  teacher_checkpoint_path: /data/OpenMidnight_ckpts/openmidnight_checkpoint.pth
+  OFFICIAL_EPOCH_LENGTH: 1250
+  num_workers: 24
+  prefetch_factor: 8
+  skip_checkpointer: false
+  gradient_accumulation_steps: 12  # 8 GPUs x 12 batch x 12 accum = 1152 (paper)
+  patch_size_pixels: 448
+student:
+  arch: vit_giant2
+  patch_size: 14
+  drop_path_rate: 0.4
+  ffn_layer: swiglufused
+  block_chunks: 4
+  num_register_tokens: 4
+teacher:
+  # Warm-start the teacher schedules at their Phase 1 final values to avoid
+  # the loss spike + classification regression caused by re-warming from base.
+  momentum_teacher: 0.9995          # was 0.994; Phase 1 ended near 1.0
+  final_momentum_teacher: 1.0
+  warmup_teacher_temp: 0.07         # was inheriting 0.04 from default; no warmup
+  teacher_temp: 0.07
+  warmup_teacher_temp_epochs: 0     # was inheriting 30
+optim:
+  epochs: 48                        # 48 x 1250 = 60k optimizer steps
+  early_stop: 48
+  weight_decay: 0.2                 # was inheriting 0.04 from default; start at terminal
+  weight_decay_end: 0.2
+  base_lr: 1.0e-04                  # paper value; sqrt-scaled to ~1.06e-4 at eff_batch=1152
+  warmup_epochs: 5                  # LR warmup still useful for fresh AdamW
+  freeze_last_layer_epochs: 0       # was inheriting 1; student head already trained
+  layerwise_decay: 0.9              # DINOv2 finetuning standard; was 1.0 (off)
+crops:
+  global_crops_scale:
+    - 0.32
+    - 1.0
+  local_crops_number: 8
+  local_crops_scale:
+    - 0.05
+    - 0.32
+  global_crops_size: 392
+  local_crops_size: 168
+evaluation:
+  eval_period_iterations: 5000
+  bach_root: /block/eva-data/bach
+  breakhis_root: /block/eva-data/breakhis
+  pcam_root: /block/eva-data/patch_camelyon
