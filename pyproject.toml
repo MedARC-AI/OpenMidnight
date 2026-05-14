@@ -41,6 +41,10 @@ dependencies = [
     "timm>=1.0.9",
     # for HEST benchmarking:
     "hestcore==1.0.4",
+    "jupyter>=1.1.1",
+    "nbconvert>=7.17.0",
+    "ipykernel>=7.2.0",
+    "python-docx>=1.2.0",
 ]
 
 [tool.setuptools.packages.find]

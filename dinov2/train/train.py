@@ -1202,11 +1202,16 @@ def do_train(cfg, model, resume=False):
 
     micro_step = 0
 
+    # log_every breaks at i >= n_iterations where i counts data-loader YIELDS
+    # (one per micro-step). The actual training termination should be the
+    # `iteration >= early_stop_iter` check below (iteration = optimizer-step
+    # count). So scale n_iterations by accum_steps to keep log_every from
+    # breaking too early when gradient_accumulation_steps > 1.
     for data in metric_logger.log_every(
         data_loader,
         10,
         header,
-        eta_target_iter + 1,
+        (eta_target_iter + 1) * accum_steps,
         start_iter,
     ):
         if iteration >= early_stop_iter:
@@ -1218,12 +1223,15 @@ def do_train(cfg, model, resume=False):
                 checkpointer.save(f"model_{iteration:07d}", iteration=iteration)
             break
 
-        #Save instantly
-        if cfg.evaluation.eval_period_iterations >= 0 and (iteration) % cfg.evaluation.eval_period_iterations == 0:
-            do_test(cfg, model, f"training_{iteration}")
-            torch.cuda.synchronize()
-        if not cfg.train.skip_checkpointer:
-            periodic_checkpointer.step(iteration)
+        # Only fire eval/checkpoint logic at the start of a new optimizer step,
+        # not on every micro-step (which would re-fire `accum_steps` times per
+        # `iteration` value and waste hours of wallclock at each eval period).
+        if micro_step % accum_steps == 0:
+            if cfg.evaluation.eval_period_iterations >= 0 and (iteration) % cfg.evaluation.eval_period_iterations == 0:
+                do_test(cfg, model, f"training_{iteration}")
+                torch.cuda.synchronize()
+            if not cfg.train.skip_checkpointer:
+                periodic_checkpointer.step(iteration)
         
         current_batch_size = data["collated_global_crops"].shape[0] / 2
         if iteration > max_iter:
