@@ -59,3 +59,5 @@ image\ copy*.png
 wsi_*.png
 *.docx
 !docs/*.docx
+# Local-only docs (technical report, generated artifacts)
+docs/
